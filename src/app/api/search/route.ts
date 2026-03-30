@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 // GET /api/search?q=powell+memo
 // Cross-table keyword search: evidence, entities, relationships, actions,
 // analyses, timeline events, politicians, institutions.

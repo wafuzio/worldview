@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 // POST /api/agent/run — trigger the research agent, streams SSE events back
 // GET  /api/agent/run — get recent run history
 

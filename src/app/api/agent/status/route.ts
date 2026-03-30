@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 // GET /api/agent/status — overall agent status: queue counts, recent runs, DB stats
 
 import { NextResponse } from 'next/server';

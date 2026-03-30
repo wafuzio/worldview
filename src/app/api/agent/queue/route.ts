@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 // GET  /api/agent/queue         — list queue items (with filters)
 // POST /api/agent/queue         — add a topic to the queue
 // PATCH /api/agent/queue        — update queue item status (skip, re-queue, etc.)

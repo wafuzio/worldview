@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 // POST /api/agent/discover — run the discovery agent to find new topics
 // GET  /api/agent/discover — get discovery run history
 
