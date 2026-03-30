@@ -1,0 +1,973 @@
+// ============================================================
+// WORLDVIEW — Political Self-Awareness Engine
+// Schema v3.0 — March 2026
+//
+// Key changes from v1:
+// - 14-pillar category system
+// - Pairwise priority comparison engine
+// - Actor-to-actor relationships (tiered: documented/interactional/analytical)
+// - Evidence credibility replaced with rule-based transparency
+// - Separate Analysis layer (data vs interpretation)
+// - Uncertainty states on evidence
+// - Action type classification for political actions
+// - Politician party history tracking
+// - Synthetic platform generation
+// - Tradeoff confrontation engine
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// QUIZ STRUCTURE
+// ============================================================
+
+// The 14 pillars — top-level issue categories
+model Category {
+  id          String     @id @default(uuid())
+  name        String     @unique
+  slug        String     @unique // URL-friendly identifier
+  description String?             // 1-2 sentence neutral description
+  order       Int        @default(0)
+
+  // Whether this pillar is cross-cutting (e.g., Personal Liberty & Moral Authority)
+  isCrossCutting Boolean @default(false)
+
+  questions   Question[]
+  evidence    Evidence[]
+  priorityComparisons PriorityComparison[] @relation("ComparisonCategoryA")
+  priorityComparisonsB PriorityComparison[] @relation("ComparisonCategoryB")
+  priorityRankings PriorityRanking[]
+
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+// Individual quiz questions with branching support
+model Question {
+  id           String    @id @default(uuid())
+  text         String    // The neutral question text — no party/candidate names
+  description  String?   // Optional context/explanation
+  categoryId   String
+  category     Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  order        Int       @default(0)
+  isActive     Boolean   @default(true)
+
+  // Question type: "scale" (1-5), "yesno", "multiple", "consensus"
+  // "consensus" = near-universal agreement expected; answer stored as
+  // a "receipt" for the tradeoff confrontation engine. These questions
+  // do NOT contribute to alignment scoring.
+  questionType String    @default("scale")
+
+  // For consensus questions: the "receipt" phrasing used in tradeoff confrontation.
+  // e.g., "You agreed that corruption is a serious problem"
+  // Null for non-consensus questions.
+  consensusText String?
+
+  // Spectrum endpoints for scale questions
+  leftLabel    String?   // e.g., "Government should provide"
+  rightLabel   String?   // e.g., "Individual responsibility"
+
+  // For yes/no questions: what does "yes" mean politically?
+  // 1 = yes is right-leaning, -1 = yes is left-leaning
+  yesValue     Int       @default(1)
+
+  // Political alignment mapping (how answers map to political positions)
+  // Stored as JSON: { "economic": 0.5, "social": 0.5, "authority": 0.3 }
+  alignmentMap String    @default("{}")
+
+  // Branching: parent question (if this is a follow-up)
+  parentId     String?
+  parent       Question? @relation("QuestionBranch", fields: [parentId], references: [id])
+  followUps    Question[] @relation("QuestionBranch")
+
+  // Condition to show this follow-up
+  // e.g., "yes", "no", ">0", "<0", ">=2"
+  branchCondition String?
+
+  answers      Answer[]
+  evidence     QuestionEvidence[]
+  politicianStances PoliticianStance[]
+  tradeoffStatements TradeoffStatement[]  // Consensus questions that triggered tradeoff confrontations
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// ============================================================
+// PAIRWISE PRIORITY RANKING ENGINE
+// ============================================================
+
+// Individual pairwise comparison: "Which matters more to you?"
+model PriorityComparison {
+  id         String   @id @default(uuid())
+  sessionId  String
+  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  // The two categories being compared
+  categoryAId String
+  categoryBId String
+  categoryA   Category @relation("ComparisonCategoryA", fields: [categoryAId], references: [id])
+  categoryB   Category @relation("ComparisonCategoryB", fields: [categoryBId], references: [id])
+
+  // Which one the user chose (ID of the winning category)
+  winnerId    String
+
+  // Time spent deciding (milliseconds) — useful for detecting engagement
+  timeSpent   Int?
+
+  createdAt   DateTime @default(now())
+
+  @@unique([sessionId, categoryAId, categoryBId])
+}
+
+// Computed ranking result from pairwise comparisons
+model PriorityRanking {
+  id         String   @id @default(uuid())
+  sessionId  String
+  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  // Final rank position (1 = most important)
+  rank       Int
+
+  // Win count from pairwise comparisons (for transparency)
+  wins       Int      @default(0)
+  losses     Int      @default(0)
+
+  // Normalized weight (0.0 to 1.0) used in scoring
+  weight     Float    @default(0)
+
+  createdAt  DateTime @default(now())
+
+  @@unique([sessionId, categoryId])
+}
+
+// ============================================================
+// EVIDENCE SYSTEM — DATA LAYER (neutral, clinical)
+// ============================================================
+
+// Source documents, articles, records, transcripts
+model Evidence {
+  id            String    @id @default(uuid())
+  title         String
+  summary       String    // Brief neutral summary
+  content       String?   // Full text if available
+  sourceUrl     String?   // Link to original
+  sourceName    String?   // e.g., "Congressional Record", "Reuters"
+  videoUrl      String?
+  transcriptUrl String?
+
+  // Dating — critical for timeline
+  publishedAt   DateTime? // When published
+  eventDate     DateTime? // When the event occurred
+  dateAccuracy  String    @default("day") // "day", "month", "year", "approximate"
+
+  // Document storage
+  documentPath  String?
+  documentType  String?   // "pdf", "docx", "txt", "html", "transcript", "video"
+
+  // For AI-assisted processing
+  rawContent    String?
+  isProcessed   Boolean   @default(false)
+  suggestedTags     String? // JSON array
+  suggestedQuestions String? // JSON array
+
+  // ── Source classification (rule-based, not subjective) ──
+
+  // Primary source type — determines base credibility
+  // "primary_source" = legislation, court filing, official transcript, vote record
+  // "secondary_source" = reporting by reputable outlet, analysis
+  // "opinion_editorial" = opinion piece, editorial, commentary
+  // "raw_data" = dataset, FEC filing, financial disclosure
+  sourceClassification String @default("secondary_source")
+
+  // Corroboration — how many independent sources confirm this?
+  corroborationCount   Int    @default(1)
+  independentSourceCount Int   @default(1) // Sources that aren't citing same origin
+
+  // Verification status — replaces subjective 1-5 credibility
+  // "verified" = confirmed by multiple independent sources
+  // "single_source" = one source, not yet corroborated
+  // "contested" = conflicting evidence exists
+  // "inconclusive" = insufficient evidence to confirm or deny
+  // "misreported" = original reporting was corrected/retracted
+  verificationStatus String @default("single_source")
+
+  // Political lean context (not a score — a classification)
+  // "supports_left_position", "supports_right_position", "neutral", "implicates_both"
+  politicalContext String @default("neutral")
+
+  categoryId    String?
+  category      Category? @relation(fields: [categoryId], references: [id])
+
+  tags          EvidenceTag[]
+  questions     QuestionEvidence[]
+  excerpts      EvidenceExcerpt[]
+  factChecks    FactCheck[]
+  politicianMentions PoliticianEvidence[]
+  institutionMentions InstitutionEvidence[]
+  entities      EvidenceEntity[]
+  eventSources  EventSource[]
+  analyses      Analysis[]
+  relationshipEvidence ActorRelationshipEvidence[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// ============================================================
+// ANALYSIS LAYER — labeled interpretation, toggleable
+// ============================================================
+
+// Interpretive analysis of evidence — ALWAYS labeled, NEVER in data layer
+model Analysis {
+  id          String   @id @default(uuid())
+  evidenceId  String
+  evidence    Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  // Who wrote this analysis
+  author      String   @default("system") // "system", "admin", specific contributor
+
+  // The interpretive content
+  title       String?
+  content     String   // The analysis text
+
+  // Classification of the claim being made
+  // "consistent_with_record" = aligns with documented facts
+  // "in_tension_with_record" = partially contradicts or is misleading
+  // "contradicted_by_record" = directly contradicted by evidence
+  // "factually_false" = provably incorrect regardless of interpretation
+  claimClassification String @default("consistent_with_record")
+
+  // Analysis type
+  // "context" = provides historical/structural context
+  // "discrepancy" = highlights contradiction between stated and actual positions
+  // "pattern" = identifies pattern across multiple evidence items
+  // "correction" = corrects a common misunderstanding
+  analysisType String @default("context")
+
+  // Is this analysis visible by default or opt-in?
+  isDefaultVisible Boolean @default(false)
+
+  // Linked to Tier 3 relationships that require analysis backing
+  relationships ActorRelationship[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ============================================================
+// ENTITIES & TAGGING
+// ============================================================
+
+// Named entities (people, organizations, places, legislation)
+model Entity {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  type        String   // "person", "organization", "place", "legislation", "court_case"
+  aliases     String?  // JSON array of alternate names/spellings
+  description String?
+  wikiUrl     String?
+  tags        String?  // JSON array of freeform tags for character mapping
+
+  // For people
+  title       String?
+  affiliation String?
+
+  evidence    EvidenceEntity[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// Many-to-many: Evidence <-> Entity with context
+model EvidenceEntity {
+  id          String   @id @default(uuid())
+  evidenceId  String
+  entityId    String
+  evidence    Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+  entity      Entity   @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  mentions    Int      @default(1)
+  sentiment   String?  // "positive", "negative", "neutral"
+  context     String?
+
+  @@unique([evidenceId, entityId])
+}
+
+// Tags for organizing evidence
+model Tag {
+  id          String        @id @default(uuid())
+  name        String        @unique
+  description String?
+  color       String        @default("#6366f1")
+
+  evidence    EvidenceTag[]
+  excerpts    ExcerptTag[]
+  synonyms    TagSynonym[]
+  events      EventTag[]
+
+  createdAt   DateTime      @default(now())
+}
+
+// Synonyms for tag matching
+model TagSynonym {
+  id      String @id @default(uuid())
+  tagId   String
+  tag     Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  phrase  String
+
+  @@unique([tagId, phrase])
+}
+
+model EvidenceTag {
+  evidenceId String
+  tagId      String
+  evidence   Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+  tag        Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([evidenceId, tagId])
+}
+
+model QuestionEvidence {
+  questionId  String
+  evidenceId  String
+  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  evidence    Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  relationship String   @default("neutral") // "supports_left", "supports_right", "neutral", "contradicts"
+  note         String?
+
+  @@id([questionId, evidenceId])
+}
+
+// Selected excerpts from evidence documents
+model EvidenceExcerpt {
+  id          String   @id @default(uuid())
+  evidenceId  String
+  evidence    Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  text        String
+  startIndex  Int?
+  endIndex    Int?
+  note        String?
+
+  tags        ExcerptTag[]
+
+  createdAt   DateTime @default(now())
+}
+
+model ExcerptTag {
+  excerptId String
+  tagId     String
+  excerpt   EvidenceExcerpt @relation(fields: [excerptId], references: [id], onDelete: Cascade)
+  tag       Tag             @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([excerptId, tagId])
+}
+
+// ============================================================
+// TIMELINE EVENTS
+// ============================================================
+
+model Event {
+  id            String   @id @default(uuid())
+  title         String
+  description   String?
+
+  eventDate     DateTime
+  endDate       DateTime?
+  dateAccuracy  String   @default("day")
+
+  location      String?
+
+  // Event classification
+  eventType     String   @default("general")
+  // "speech", "vote", "policy", "scandal", "election", "protest",
+  // "legislation", "court_decision", "executive_order", "appointment",
+  // "resignation", "investigation", "general"
+
+  significance  Int      @default(3) // 1-5
+
+  primaryActors String?  // JSON array
+
+  tags          EventTag[]
+  sources       EventSource[]
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model EventTag {
+  eventId String
+  tagId   String
+  event   Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tag     Tag   @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([eventId, tagId])
+}
+
+model EventSource {
+  id          String   @id @default(uuid())
+  eventId     String
+  evidenceId  String
+  event       Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  evidence    Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  relationship String  @default("mentions")
+  excerpt      String?
+
+  createdAt    DateTime @default(now())
+
+  @@unique([eventId, evidenceId])
+}
+
+// ============================================================
+// USER SESSIONS & RESPONSES
+// ============================================================
+
+model Session {
+  id           String    @id @default(uuid())
+
+  userToken    String?   @unique
+  nickname     String?
+
+  // ── Phase: belief assessment ──
+  answers      Answer[]
+
+  // ── Phase: priority ranking ──
+  priorityComparisons PriorityComparison[]
+  priorityRankings    PriorityRanking[]
+
+  // ── Computed results ──
+  economicScore    Float?
+  socialScore      Float?
+  authorityScore   Float? // libertarian (-1) to authoritarian (1)
+  overallScore     Float?
+
+  // Weighted scores (after priority ranking applied)
+  weightedEconomicScore Float?
+  weightedSocialScore   Float?
+  weightedAuthorityScore Float?
+
+  // JSON blob of detailed results by category
+  detailedResults  String?
+
+  // ── Synthetic platform ──
+  syntheticPlatform SyntheticPlatform?
+
+  // ── Tradeoff confrontations ──
+  tradeoffs        TradeoffStatement[]
+
+  // ── Comparisons ──
+  comparisonsAsA   SessionComparison[] @relation("ComparisonSessionA")
+  comparisonsAsB   SessionComparison[] @relation("ComparisonSessionB")
+
+  isComplete   Boolean   @default(false)
+  completedAt  DateTime?
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// Individual question answers
+model Answer {
+  id         String   @id @default(uuid())
+  sessionId  String
+  questionId String
+  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  // Answer value: -2 (strongly left) to 2 (strongly right), 0 = neutral
+  value      Int
+
+  timeSpent  Int?     // seconds
+
+  createdAt  DateTime @default(now())
+
+  @@unique([sessionId, questionId])
+}
+
+// ============================================================
+// SYNTHETIC PLATFORM & TRADEOFF ENGINE
+// ============================================================
+
+// Generated "ideal platform" based on user's beliefs + priorities
+model SyntheticPlatform {
+  id        String  @id @default(uuid())
+  sessionId String  @unique
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  // JSON: per-category ideal positions derived from answers
+  // { "economy": { "position": -0.6, "keyBeliefs": [...] }, ... }
+  platformPositions String
+
+  // Distance scores from each party's actual record
+  // { "democratic": 0.35, "republican": 0.72 }
+  partyDistances    String
+
+  // JSON: the generated "platform summary" in plain language
+  platformSummary   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Explicit tradeoff statements that force rationalization into language
+model TradeoffStatement {
+  id        String  @id @default(uuid())
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  // The tradeoff in structured form
+  // "You ranked [priorityTopic] as #[priorityRank]"
+  // "But you aligned with [party] which has [record] on this topic"
+  // "To maintain this alignment, you would need to believe [lowerTopic] matters more than [priorityTopic]"
+
+  // Source type: "priority" = priority-vs-alignment conflict,
+  //              "consensus" = user agreed to X but their values align with positions that contradict X
+  sourceType      String  @default("priority")
+
+  priorityTopic   String?  // The high-priority topic (for priority-type)
+  priorityRank    Int?     // Where it ranked (for priority-type)
+  alignedParty    String   // Which party their answers align with on other issues
+  conflictSummary String   // Plain language description of the contradiction
+  tradeoffCost    String   // What they'd have to accept to maintain alignment
+
+  // For consensus-type tradeoffs: link back to the consensus question they agreed with
+  consensusQuestionId String?
+  consensusQuestion   Question? @relation(fields: [consensusQuestionId], references: [id])
+
+  // Severity: how significant is this contradiction?
+  severity        Float   @default(0.5) // 0.0 (minor) to 1.0 (fundamental)
+
+  createdAt       DateTime @default(now())
+}
+
+// ============================================================
+// SESSION COMPARISON — "Two people, one chart"
+// ============================================================
+// Shows how two users with different political identities overlap
+// on values-level answers. The killer insight: most Americans agree
+// on 60-80% of foundational beliefs. The divergence is in priorities
+// and tribal trust, not values.
+
+model SessionComparison {
+  id          String   @id @default(uuid())
+
+  sessionAId  String
+  sessionBId  String
+  sessionA    Session  @relation("ComparisonSessionA", fields: [sessionAId], references: [id], onDelete: Cascade)
+  sessionB    Session  @relation("ComparisonSessionB", fields: [sessionBId], references: [id], onDelete: Cascade)
+
+  // Overall agreement percentage across all shared questions (0.0 - 1.0)
+  overallAgreement Float
+
+  // Per-pillar agreement breakdown
+  // JSON: { "economy-fiscal-policy": 0.82, "immigration-border-policy": 0.45, ... }
+  pillarAgreement  String
+
+  // Questions where they gave the same answer (within 1 point on scale)
+  // JSON: array of { questionId, questionText, answerA, answerB, pillar }
+  convergenceZones String
+
+  // Questions where they diverged significantly (3+ points apart on scale)
+  // JSON: array of { questionId, questionText, answerA, answerB, pillar }
+  divergenceZones  String
+
+  // Priority ranking overlap — do they care about the same things?
+  // JSON: { overlap: ["money-in-politics", "healthcare"], divergent: { A: "immigration", B: "environment" } }
+  priorityOverlap  String?
+
+  // The confrontation: "You both agree on X, Y, Z — so why different parties?"
+  // JSON: array of { sharedBelief, partyARecord, partyBRecord, implication }
+  sharedBeliefConflicts String?
+
+  // Labels (optional) — users can self-identify for the comparison
+  labelA     String?  // e.g., "Conservative", "Progressive", "Independent"
+  labelB     String?
+
+  createdAt  DateTime @default(now())
+
+  @@unique([sessionAId, sessionBId])
+}
+
+// ============================================================
+// POLITICAL ACTORS & RELATIONSHIPS
+// ============================================================
+
+// Politicians, parties, lobbyists, organizations, public figures
+model Politician {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  type        String   // "politician", "party", "lobbyist", "pac", "corporation", "media_figure", "organization"
+  description String?
+  imageUrl    String?
+
+  title       String?
+  affiliation String?
+
+  // Position scores
+  economicScore Float?
+  socialScore   Float?
+  authorityScore Float?
+
+  positions   String?  // JSON blob of positions by category
+  tags        String?  // JSON array of freeform tags for character mapping (e.g. ["dark money", "federalist society", "koch network"])
+
+  stances     PoliticianStance[]
+  evidenceMentions PoliticianEvidence[]
+  statements  Statement[]
+  partyHistory PoliticianPartyHistory[]
+
+  // Relationships where this actor is the source
+  relationshipsFrom ActorRelationship[] @relation("RelationshipSource")
+  // Relationships where this actor is the target
+  relationshipsTo   ActorRelationship[] @relation("RelationshipTarget")
+
+  // Political actions (votes, appointments, etc.)
+  actions     PoliticalAction[]
+
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// Track party affiliation changes over time (e.g., party realignment)
+model PoliticianPartyHistory {
+  id           String     @id @default(uuid())
+  politicianId String
+  politician   Politician @relation(fields: [politicianId], references: [id], onDelete: Cascade)
+
+  party        String     // "Democratic", "Republican", "Whig", "Independent", etc.
+  startDate    DateTime
+  endDate      DateTime?  // null = current
+  reason       String?    // Why they switched or context
+
+  createdAt    DateTime   @default(now())
+}
+
+// ── Actor-to-Actor Relationships (tiered) ──
+
+model ActorRelationship {
+  id            String     @id @default(uuid())
+
+  // Directed edge: source → target
+  sourceId      String
+  targetId      String
+  source        Politician @relation("RelationshipSource", fields: [sourceId], references: [id], onDelete: Cascade)
+  target        Politician @relation("RelationshipTarget", fields: [targetId], references: [id], onDelete: Cascade)
+
+  // ── Relationship tier (structural constraint) ──
+  // "documented" = FEC record, official appointment, roll call vote, employment record
+  // "interactional" = meeting log, correspondence, testimony, lobbying disclosure
+  // "analytical" = requires linked Analysis record; CANNOT exist without one
+  tier          String     @default("documented")
+
+  // Relationship type — must match tier
+  // Tier 1 (documented): "funded_by", "appointed_by", "employed_by", "voted_for",
+  //   "donated_to", "contracted_with", "endorsed"
+  // Tier 2 (interactional): "met_with", "communicated_with", "testified_before",
+  //   "lobbied", "briefed_by", "served_on_board_with"
+  // Tier 3 (analytical): "influenced_by", "aligned_with", "protected_by",
+  //   "enabled", "shielded_from_investigation"
+  relationshipType String
+
+  // When this relationship existed
+  startDate     DateTime?
+  endDate       DateTime?
+
+  // Severity/significance for corruption map weighting
+  significance  Int        @default(3) // 1-5
+
+  // Context
+  description   String?
+  amount        Float?     // For financial relationships (donations, contracts)
+  currency      String?    @default("USD")
+
+  // Required for Tier 3 — analytical relationships must have backing analysis
+  analysisId    String?
+  analysis      Analysis?  @relation(fields: [analysisId], references: [id])
+
+  // Source evidence — every relationship must have at least one
+  evidence      ActorRelationshipEvidence[]
+
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  @@unique([sourceId, targetId, relationshipType, startDate])
+}
+
+// Junction: which evidence supports this relationship
+model ActorRelationshipEvidence {
+  relationshipId String
+  evidenceId     String
+  relationship   ActorRelationship @relation(fields: [relationshipId], references: [id], onDelete: Cascade)
+  evidence       Evidence          @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  excerpt        String?  // Specific quote/reference from the evidence
+
+  @@id([relationshipId, evidenceId])
+}
+
+// ── Political Actions (formalized action types) ──
+
+model PoliticalAction {
+  id           String     @id @default(uuid())
+  politicianId String
+  politician   Politician @relation(fields: [politicianId], references: [id], onDelete: Cascade)
+
+  // What happened
+  title        String
+  description  String?
+
+  // When
+  actionDate   DateTime
+  dateAccuracy String     @default("day")
+
+  // ── Action type classification ──
+  // "voted_yes" = voted in favor on the floor
+  // "voted_no" = voted against on the floor
+  // "sponsored" = introduced/co-sponsored legislation
+  // "blocked" = actively blocked (filibuster, hold, etc.)
+  // "procedural_block" = committee kill, rules-based suppression (before floor vote)
+  // "symbolic_vote" = pure signaling, no real outcome expected
+  // "signed" = signed into law (executive)
+  // "vetoed" = vetoed legislation
+  // "executive_order" = executive action
+  // "appointed" = made an appointment
+  // "public_stance" = stated position without corresponding action
+  // "reversed_position" = changed stated position
+  // "abstained" = deliberately did not vote
+  // "attempted_failed" = tried but could not achieve outcome
+  actionType   String
+
+  // What was acted upon
+  targetLegislation String?  // Bill name/number if applicable
+  targetEntity      String?  // Who/what was the target
+
+  // Context — critical for interpretation
+  // Was this a bundled bill? Strategic vote? Poison pill?
+  context      String?
+
+  // Was the action's public framing consistent with its actual effect?
+  // "consistent" = the framing matches the action
+  // "misleading" = the framing obscures the actual effect
+  // "opposite" = the action achieves the opposite of claimed intent
+  framingAccuracy String @default("consistent")
+
+  // Link to source evidence
+  sourceUrl    String?
+  sourceDescription String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// Politician's stance on a specific question
+model PoliticianStance {
+  id           String     @id @default(uuid())
+  politicianId String
+  politician   Politician @relation(fields: [politicianId], references: [id], onDelete: Cascade)
+  questionId   String
+  question     Question   @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  publicStance  Int?      // -2 to 2
+  actionStance  Int?      // -2 to 2 (based on actual votes/actions)
+
+  publicSource  String?
+  actionSource  String?
+  discrepancyNote String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([politicianId, questionId])
+}
+
+// Link politicians to evidence
+model PoliticianEvidence {
+  politicianId String
+  evidenceId   String
+  politician   Politician @relation(fields: [politicianId], references: [id], onDelete: Cascade)
+  evidence     Evidence   @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  portrayal    String     @default("mentioned")
+  excerpt      String?
+
+  @@id([politicianId, evidenceId])
+}
+
+// ============================================================
+// FACT-CHECKING & ACCOUNTABILITY
+// ============================================================
+
+// Statements, promises, and claims to track over time
+model Statement {
+  id           String     @id @default(uuid())
+  politicianId String
+  politician   Politician @relation(fields: [politicianId], references: [id], onDelete: Cascade)
+
+  text         String
+  statementType String    @default("claim")
+  // "promise", "claim", "prediction", "denial", "reversal"
+
+  madeAt       DateTime?
+  source       String?
+  context      String?
+
+  // Status with uncertainty handling
+  // "pending", "kept", "broken", "partially_kept", "in_progress",
+  // "confirmed", "contested", "inconclusive", "misreported"
+  status       String     @default("pending")
+
+  factChecks   FactCheck[]
+
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+}
+
+model FactCheck {
+  id          String    @id @default(uuid())
+  statementId String
+  statement   Statement @relation(fields: [statementId], references: [id], onDelete: Cascade)
+  evidenceId  String
+  evidence    Evidence  @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  // "confirms", "contradicts", "partially_confirms", "adds_context", "disputed"
+  relationship String
+
+  analysis    String?
+
+  createdAt   DateTime  @default(now())
+
+  @@unique([statementId, evidenceId])
+}
+
+// ============================================================
+// INSTITUTIONS
+// ============================================================
+
+model Institution {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  type        String   // "government", "media", "nonprofit", "corporation", "regulatory_body"
+  description String?
+
+  // Perception vs reality — computed from evidence density
+  perceivedIntegrity Float?
+  actualIntegrity    Float?
+
+  evidence    InstitutionEvidence[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model InstitutionEvidence {
+  institutionId String
+  evidenceId    String
+  institution   Institution @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  evidence      Evidence    @relation(fields: [evidenceId], references: [id])
+
+  relationship  String    // "supports_integrity", "shows_corruption", "neutral"
+  note          String?
+
+  @@id([institutionId, evidenceId])
+}
+
+// ============================================================
+// RESEARCH AGENT — automated topic discovery and ingestion
+// ============================================================
+
+// Queue of topics waiting to be researched by the agent
+model ResearchQueue {
+  id          String   @id @default(uuid())
+
+  topic       String   // The research topic / question
+  rationale   String?  // Why this topic was suggested
+  priority    String   @default("medium") // "high", "medium", "low"
+  depth       String   @default("standard") // "standard", "deep"
+
+  // Where this topic came from
+  // "suggested" = from a previous research run's suggestedTopics
+  // "discovered" = from web discovery agent
+  // "manual" = added by admin
+  // "gap_fill" = identified from coverage gap analysis
+  source      String   @default("manual")
+  sourceRunId String?  // AgentRun that produced this suggestion
+  sourceRun   AgentRun? @relation("RunSuggestions", fields: [sourceRunId], references: [id])
+
+  // Processing state
+  // "pending" = waiting to be picked up
+  // "processing" = currently being researched
+  // "completed" = successfully researched and ingested
+  // "failed" = research attempt failed
+  // "skipped" = admin decided to skip this
+  status      String   @default("pending")
+  error       String?  // Error message if failed
+  attempts    Int      @default(0)
+  maxAttempts Int      @default(3)
+
+  // Link to the run that processed this item
+  processedByRunId String?
+  processedByRun   AgentRun? @relation("RunProcessed", fields: [processedByRunId], references: [id])
+
+  // Results summary
+  evidenceCreated     Int?
+  entitiesCreated     Int?
+  relationshipsCreated Int?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  processedAt DateTime?
+}
+
+// Log of agent runs — each invocation creates one
+model AgentRun {
+  id          String   @id @default(uuid())
+
+  // What triggered this run
+  // "manual" = admin clicked Run
+  // "auto" = scheduled/automatic
+  // "discovery" = web discovery pass
+  runType     String   @default("manual")
+
+  // Processing state
+  status      String   @default("running") // "running", "completed", "failed", "cancelled"
+
+  // Stats
+  topicsProcessed   Int @default(0)
+  topicsSucceeded   Int @default(0)
+  topicsFailed      Int @default(0)
+  topicsDiscovered  Int @default(0)
+  evidenceCreated   Int @default(0)
+  entitiesCreated   Int @default(0)
+
+  // Configuration used
+  maxTopics         Int @default(5)  // How many topics to process in one run
+  depth             String @default("standard")
+
+  // Log output
+  log               String? // JSON array of log entries
+
+  // Items this run suggested
+  suggestions       ResearchQueue[] @relation("RunSuggestions")
+  // Items this run processed
+  processed         ResearchQueue[] @relation("RunProcessed")
+
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
