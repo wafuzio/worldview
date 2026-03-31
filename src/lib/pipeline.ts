@@ -7,6 +7,7 @@
 import { prisma } from './db';
 import { suggestActorImage } from './actor-image';
 import { callLLM, parseJSONResponse } from './llm';
+import { validateRelationships, type ValidationSummary } from './relationship-validation';
 
 // ── Input types (matches the research protocol JSON format) ──
 
@@ -121,6 +122,7 @@ export type IngestionResult = {
   };
   errors: string[];
   warnings: string[];
+  validationSummary?: ValidationSummary;
 };
 
 // ── Main pipeline function ──
@@ -219,9 +221,31 @@ export async function ingestResearch(input: ResearchInput): Promise<IngestionRes
       }
     }
 
-    // Step 5: Create actor relationships (upsert to merge duplicates)
+    // Step 5: Validate and create actor relationships (upsert to merge duplicates)
     if (normalizedInput.relationships?.length) {
-      for (const rel of normalizedInput.relationships) {
+      // Run common-sense validation before inserting
+      const { validated, summary: valSummary } = validateRelationships(
+        normalizedInput.relationships,
+        normalizedInput.entities || [],
+      );
+      result.validationSummary = valSummary;
+
+      // Log validation summary
+      if (valSummary.dropped > 0) {
+        result.warnings.push(`Validation: dropped ${valSummary.dropped} impossible relationships`);
+      }
+      if (valSummary.autoFixed > 0) {
+        result.warnings.push(`Validation: auto-fixed ${valSummary.autoFixed} relationships (e.g. flipped direction)`);
+      }
+      for (const issue of valSummary.issues.filter((i) => i.severity === 'error' || i.code === 'DIRECTION_FLIPPED')) {
+        result.warnings.push(`Validation: ${issue.message}`);
+      }
+
+      for (const { relationship: rel, issues, dropped } of validated) {
+        if (dropped) {
+          result.warnings.push(`Dropped relationship: ${issues.map((i) => i.message).join('; ')}`);
+          continue;
+        }
         try {
           const sourceId = actorMap.get(rel.sourceName);
           const targetId = actorMap.get(rel.targetName);
@@ -442,7 +466,7 @@ Return JSON array only:
   {
     "originalName": "incoming string",
     "canonicalName": "best canonical name",
-    "canonicalType": "politician|organization|legislation|event|court_case|party|pac|corporation|lobbyist|media_figure|concept",
+    "canonicalType": "politician|donor|operative|organization|legislation|event|court_case|party|pac|corporation|lobbyist|media_figure|concept",
     "mergeWithExistingName": "exact existing node name if same entity, else null",
     "drop": false,
     "reason": "short reason"
@@ -576,6 +600,8 @@ ${existingActors.map((a) => `- ${a.name} (${a.type})`).join('\n')}`,
 function normalizeForMatch(value: string): string {
   return value
     .toLowerCase()
+    // Strip parenthetical type qualifiers before anything else, e.g. "(politician)", "(organization)"
+    .replace(/\s*\([^)]*\)/g, '')
     .replace(/[.,/#!$%^&*;:{}=\-_`~()'"?]/g, ' ')
     .replace(/\b(the|of|and|for|to|in|on|at|by|corp|corporation|inc|incorporated|co|company|ltd|llc|plc)\b/g, ' ')
     .replace(/\s+/g, ' ')
@@ -632,8 +658,10 @@ function findBestEntityMatch(name: string, entities: EntityInput[]): EntityInput
 function mapEntityTypeToActorType(type?: string): string {
   const t = String(type || '').toLowerCase().trim();
   if (!t) return 'politician';
-  if (['person', 'politician'].includes(t)) return 'politician';
-  if (['organization', 'org', 'institution'].includes(t)) return 'organization';
+  if (['person', 'politician', 'judge', 'senator', 'representative', 'governor', 'official'].includes(t)) return 'politician';
+  if (['donor', 'megadonor', 'philanthropist', 'funder', 'benefactor', 'financier'].includes(t)) return 'donor';
+  if (['operative', 'strategist', 'fixer', 'advisor', 'political_consultant', 'architect'].includes(t)) return 'operative';
+  if (['organization', 'org', 'institution', 'think_tank', 'nonprofit', 'ngo'].includes(t)) return 'organization';
   if (['legislation', 'law', 'act', 'bill', 'statute'].includes(t)) return 'legislation';
   if (['event', 'incident', 'protest', 'hearing', 'election'].includes(t)) return 'event';
   if (['court_case', 'case', 'legal_case'].includes(t)) return 'court_case';
@@ -641,6 +669,8 @@ function mapEntityTypeToActorType(type?: string): string {
   if (t.includes('act') || t.includes('bill') || t.includes('statute')) return 'legislation';
   if (t.includes('event') || t.includes('hearing') || t.includes('protest') || t.includes('election')) return 'event';
   if (t.includes('court') || t.includes('v.')) return 'court_case';
+  if (t.includes('donor') || t.includes('funder')) return 'donor';
+  if (t.includes('operative') || t.includes('strategist')) return 'operative';
   return t;
 }
 

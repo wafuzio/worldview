@@ -46,6 +46,29 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url);
     const q = (searchParams.get('q') || '').trim().toLowerCase();
     const limit = Math.max(1, Math.min(parseInt(searchParams.get('limit') || '200'), 500));
+    const includeAll = searchParams.get('all') === 'true';
+
+    if (includeAll) {
+      const where = q
+        ? {
+            isActive: true,
+            OR: [
+              { name: { contains: q } },
+              { type: { contains: q } },
+              { description: { contains: q } },
+            ],
+          }
+        : { isActive: true };
+
+      const rows = await prisma.politician.findMany({
+        where,
+        select: { id: true, name: true, type: true },
+        orderBy: { name: 'asc' },
+        take: limit,
+      });
+
+      return NextResponse.json({ items: rows });
+    }
 
     const rows = await prisma.politician.findMany({
       where: {
@@ -105,9 +128,6 @@ export async function POST(request: NextRequest) {
       if (!existingTarget) {
         return NextResponse.json({ error: 'Target node not found' }, { status: 404 });
       }
-      if (!isPlaceholderNode(existingTarget)) {
-        return NextResponse.json({ error: 'Target must be an existing placeholder node' }, { status: 400 });
-      }
       target = { id: existingTarget.id, name: existingTarget.name, type: existingTarget.type };
     } else {
       const targetType = ALLOWED_TYPES.has(targetTypeRaw) ? targetTypeRaw : 'organization';
@@ -121,17 +141,43 @@ export async function POST(request: NextRequest) {
 
       target = candidates.find((a) => normalizeName(a.name) === normalizedTarget) || null;
       if (!target) {
-        target = await prisma.politician.create({
-          data: {
-            name: targetName,
-            type: targetType,
-            description: 'Placeholder node pending evidence-backed enrichment.',
-            tags: JSON.stringify(['placeholder', 'needs_verification']),
-            isActive: true,
-          },
+        const existingExact = await prisma.politician.findFirst({
+          where: { name: targetName },
           select: { id: true, name: true, type: true },
         });
-        createdTarget = true;
+
+        if (existingExact) {
+          target = existingExact;
+        } else {
+          try {
+            target = await prisma.politician.create({
+              data: {
+                name: targetName,
+                type: targetType,
+                description: 'Placeholder node pending evidence-backed enrichment.',
+                tags: JSON.stringify(['placeholder', 'needs_verification']),
+                isActive: true,
+              },
+              select: { id: true, name: true, type: true },
+            });
+            createdTarget = true;
+          } catch (createErr: any) {
+            // Gracefully recover if a duplicate name was inserted concurrently.
+            if (createErr?.code === 'P2002') {
+              const existingAfterCollision = await prisma.politician.findFirst({
+                where: { name: targetName },
+                select: { id: true, name: true, type: true },
+              });
+              if (existingAfterCollision) {
+                target = existingAfterCollision;
+              } else {
+                throw createErr;
+              }
+            } else {
+              throw createErr;
+            }
+          }
+        }
       }
     }
 
@@ -189,7 +235,7 @@ export async function POST(request: NextRequest) {
           { topic: { contains: source.name.slice(0, 40) } },
           { topic: { contains: target.name.slice(0, 40) } },
         ],
-        status: { in: ['pending', 'processing', 'completed'] },
+        status: { in: ['pending', 'processing'] },
       },
       select: { id: true, topic: true, status: true },
     });

@@ -26,33 +26,66 @@ export default function QuizPage() {
   const [answers, setAnswers] = useState<Record<string, number>>({});
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Get or create session token
-    let token = localStorage.getItem('quiz_session_token');
-    if (!token) {
-      token = uuidv4();
-      localStorage.setItem('quiz_session_token', token);
-    }
+    let mounted = true;
 
-    // Start session and fetch questions
-    fetch('/api/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userToken: token }),
-    })
-      .then((res) => res.json())
-      .then((data) => {
-        setSessionId(data.id);
-        return fetch('/api/questions');
-      })
-      .then((res) => res.json())
-      .then((data) => {
-        setQuestions(data);
-        const roots = (data as Question[]).filter((q) => !q.parentId);
+    const parseJSONSafe = async (res: Response) => {
+      const text = await res.text();
+      if (!text) return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    };
+
+    const bootstrapQuiz = async () => {
+      try {
+    // Get or create session token
+        let token = localStorage.getItem('quiz_session_token');
+        if (!token) {
+          token = uuidv4();
+          localStorage.setItem('quiz_session_token', token);
+        }
+
+        const sessionRes = await fetch('/api/sessions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userToken: token }),
+        });
+        const sessionData = await parseJSONSafe(sessionRes);
+        if (!sessionRes.ok || !sessionData?.id) {
+          throw new Error(sessionData?.error || `Failed to start session (${sessionRes.status})`);
+        }
+
+        const questionsRes = await fetch('/api/questions');
+        const questionsData = await parseJSONSafe(questionsRes);
+        if (!questionsRes.ok || !Array.isArray(questionsData)) {
+          throw new Error(
+            questionsData?.error || `Failed to load questions (${questionsRes.status})`
+          );
+        }
+
+        if (!mounted) return;
+        setSessionId(sessionData.id);
+        setQuestions(questionsData as Question[]);
+        const roots = (questionsData as Question[]).filter((q) => !q.parentId);
         setQuestionOrder(roots.map((q) => q.id));
-        setLoading(false);
-      });
+      } catch (e: any) {
+        if (!mounted) return;
+        setError(e?.message || 'Failed to initialize quiz');
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    };
+
+    bootstrapQuiz();
+
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   const getQuestionById = (id: string) => questions.find((q) => q.id === id) || null;
@@ -121,6 +154,23 @@ export default function QuizPage() {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-xl text-slate-600">Loading quiz...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-4">
+        <div className="max-w-lg w-full bg-white border border-red-200 rounded-xl p-6">
+          <h1 className="text-lg font-semibold text-red-700">Could not load quiz</h1>
+          <p className="text-sm text-slate-600 mt-2">{error}</p>
+          <button
+            onClick={() => window.location.reload()}
+            className="mt-4 px-4 py-2 rounded-lg bg-slate-900 text-white hover:bg-slate-800 text-sm"
+          >
+            Retry
+          </button>
+        </div>
       </div>
     );
   }

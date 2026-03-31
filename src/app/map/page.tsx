@@ -26,6 +26,8 @@ const REL_LABELS: Record<string, string> = {
 // ── Type badge colors ──
 const TYPE_BADGE: Record<string, { bg: string; text: string }> = {
   politician: { bg: 'bg-blue-50', text: 'text-blue-600' },
+  donor: { bg: 'bg-green-50', text: 'text-green-700' },
+  operative: { bg: 'bg-violet-50', text: 'text-violet-600' },
   party: { bg: 'bg-purple-50', text: 'text-purple-600' },
   lobbyist: { bg: 'bg-amber-50', text: 'text-amber-600' },
   pac: { bg: 'bg-emerald-50', text: 'text-emerald-600' },
@@ -51,15 +53,46 @@ interface SearchResult {
   affiliation: string | null;
 }
 
-interface PlaceholderOption {
+interface ExistingNodeOption {
   id: string;
   name: string;
   type: string;
 }
 
+interface PathTraceResult {
+  found: boolean;
+  hops?: number;
+  message?: string;
+  from?: { id: string; name: string; type: string };
+  to?: { id: string; name: string; type: string };
+  nodes?: { id: string; name: string; type: string }[];
+  edges?: {
+    id: string;
+    sourceId: string;
+    sourceName: string;
+    targetId: string;
+    targetName: string;
+    relationshipType: string;
+    tier: string;
+    significance: number;
+    description: string | null;
+    evidenceCount: number;
+    originalDirection: 'forward' | 'reverse';
+  }[];
+}
+
+function normalizeNodeName(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export default function MapPage() {
   const [nodes, setNodes] = useState<GraphNode[]>([]);
   const [edges, setEdges] = useState<GraphEdge[]>([]);
+  const [viaNodeIds, setViaNodeIds] = useState<Set<string>>(new Set());
   const [centerId, setCenterId] = useState<string | null>(null);
   const [centerName, setCenterName] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -81,11 +114,19 @@ export default function MapPage() {
   const [newLinkedNodeName, setNewLinkedNodeName] = useState('');
   const [newLinkedNodeType, setNewLinkedNodeType] = useState('organization');
   const [placeholderQuery, setPlaceholderQuery] = useState('');
-  const [placeholderOptions, setPlaceholderOptions] = useState<PlaceholderOption[]>([]);
-  const [selectedPlaceholderId, setSelectedPlaceholderId] = useState('');
-  const [loadingPlaceholders, setLoadingPlaceholders] = useState(false);
+  const [existingNodeOptions, setExistingNodeOptions] = useState<ExistingNodeOption[]>([]);
+  const [selectedExistingNodeId, setSelectedExistingNodeId] = useState('');
+  const [loadingExistingNodes, setLoadingExistingNodes] = useState(false);
   const [linking, setLinking] = useState(false);
   const [linkStatus, setLinkStatus] = useState<string | null>(null);
+  const [traceNodeOptions, setTraceNodeOptions] = useState<ExistingNodeOption[]>([]);
+  const [loadingTraceNodes, setLoadingTraceNodes] = useState(false);
+  const [traceFromName, setTraceFromName] = useState('');
+  const [traceToName, setTraceToName] = useState('');
+  const [tracingPath, setTracingPath] = useState(false);
+  const [traceError, setTraceError] = useState<string | null>(null);
+  const [traceResult, setTraceResult] = useState<PathTraceResult | null>(null);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   // ── Fetch graph data ──
   const fetchGraph = useCallback(
@@ -105,6 +146,7 @@ export default function MapPage() {
         const data = await res.json();
         setNodes(data.nodes || []);
         setEdges(data.edges || []);
+        setViaNodeIds(new Set<string>(data.viaNodeIds || []));
       } catch (err) {
         console.error('Failed to fetch graph:', err);
       } finally {
@@ -155,6 +197,7 @@ export default function MapPage() {
   const handleNodeSelect = useCallback((node: GraphNode | null) => {
     setSelectedNode(node);
     setLinkStatus(null);
+    if (node) setMobileSidebarOpen(true);
   }, []);
 
   const handleNodeExpand = useCallback((nodeId: string) => {
@@ -202,31 +245,48 @@ export default function MapPage() {
     }
   }, [inspectedNode, newLinkedNodeName, newLinkedNodeType, fetchGraph, centerId, depth]);
 
-  const loadPlaceholderOptions = useCallback(async () => {
-    setLoadingPlaceholders(true);
+  const loadExistingNodeOptions = useCallback(async (query?: string) => {
+    setLoadingExistingNodes(true);
     try {
-      const res = await fetch('/api/graph/placeholders?limit=300');
+      const params = new URLSearchParams();
+      params.set('all', 'true');
+      params.set('limit', '500');
+      const q = (query ?? placeholderQuery).trim();
+      if (q) params.set('q', q);
+
+      const res = await fetch(`/api/graph/placeholders?${params.toString()}`);
       const data = await res.json();
       const items = Array.isArray(data?.items) ? data.items : [];
-      setPlaceholderOptions(items);
-      if (items.length > 0 && !selectedPlaceholderId) {
-        setSelectedPlaceholderId(items[0].id);
+      setExistingNodeOptions(items);
+      if (items.length === 0) {
+        setSelectedExistingNodeId('');
+      } else if (!items.some((item: ExistingNodeOption) => item.id === selectedExistingNodeId)) {
+        setSelectedExistingNodeId(items[0].id);
       }
     } catch {
-      setPlaceholderOptions([]);
+      setExistingNodeOptions([]);
+      setSelectedExistingNodeId('');
     } finally {
-      setLoadingPlaceholders(false);
+      setLoadingExistingNodes(false);
     }
-  }, [selectedPlaceholderId]);
+  }, [placeholderQuery, selectedExistingNodeId]);
 
   useEffect(() => {
     if (editorMode) {
-      loadPlaceholderOptions();
+      loadExistingNodeOptions('');
     }
-  }, [editorMode, loadPlaceholderOptions]);
+  }, [editorMode, loadExistingNodeOptions]);
 
-  const connectExistingPlaceholder = useCallback(async () => {
-    if (!inspectedNode || !selectedPlaceholderId) return;
+  useEffect(() => {
+    if (!editorMode) return;
+    const timeout = setTimeout(() => {
+      loadExistingNodeOptions(placeholderQuery);
+    }, 250);
+    return () => clearTimeout(timeout);
+  }, [editorMode, placeholderQuery, loadExistingNodeOptions]);
+
+  const connectExistingNode = useCallback(async () => {
+    if (!inspectedNode || !selectedExistingNodeId) return;
     setLinking(true);
     setLinkStatus(null);
     try {
@@ -235,12 +295,12 @@ export default function MapPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sourceId: inspectedNode.id,
-          targetId: selectedPlaceholderId,
+          targetId: selectedExistingNodeId,
           relationshipType: 'placeholder_link',
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to connect existing placeholder');
+      if (!res.ok) throw new Error(data.error || 'Failed to connect existing node');
 
       const queueText = data.queued
         ? 'Research topic queued.'
@@ -250,11 +310,72 @@ export default function MapPage() {
       setLinkStatus(`Linked ${inspectedNode.name} -> ${data.target?.name}. ${queueText}`);
       await fetchGraph(centerId, depth);
     } catch (e: any) {
-      setLinkStatus(e.message || 'Failed connecting placeholder');
+      setLinkStatus(e.message || 'Failed connecting existing node');
     } finally {
       setLinking(false);
     }
-  }, [inspectedNode, selectedPlaceholderId, fetchGraph, centerId, depth]);
+  }, [inspectedNode, selectedExistingNodeId, fetchGraph, centerId, depth]);
+
+  const loadTraceNodeOptions = useCallback(async () => {
+    setLoadingTraceNodes(true);
+    try {
+      const res = await fetch('/api/graph/placeholders?all=true&limit=5000');
+      const data = await res.json();
+      const items = Array.isArray(data?.items) ? data.items : [];
+      setTraceNodeOptions(items);
+    } catch {
+      setTraceNodeOptions([]);
+    } finally {
+      setLoadingTraceNodes(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadTraceNodeOptions();
+  }, [loadTraceNodeOptions]);
+
+  const traceConnectionPath = useCallback(async () => {
+    setTraceError(null);
+    setTraceResult(null);
+    const fromInput = traceFromName.trim();
+    const toInput = traceToName.trim();
+    if (!fromInput || !toInput) {
+      setTraceError('Enter both node names to trace a path.');
+      return;
+    }
+
+    const fromNorm = normalizeNodeName(fromInput);
+    const toNorm = normalizeNodeName(toInput);
+    const fromMatch = traceNodeOptions.find((n) => normalizeNodeName(n.name) === fromNorm)
+      || traceNodeOptions.find((n) => normalizeNodeName(n.name).includes(fromNorm));
+    const toMatch = traceNodeOptions.find((n) => normalizeNodeName(n.name) === toNorm)
+      || traceNodeOptions.find((n) => normalizeNodeName(n.name).includes(toNorm));
+
+    if (!fromMatch || !toMatch) {
+      setTraceError('Could not resolve one or both node names. Pick from suggestions or refresh node list.');
+      return;
+    }
+
+    setTracingPath(true);
+    try {
+      const params = new URLSearchParams({
+        fromId: fromMatch.id,
+        toId: toMatch.id,
+      });
+      const res = await fetch(`/api/graph/path?${params.toString()}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to trace path');
+      setTraceResult(data);
+      if (data?.found && data?.from?.id) {
+        selectCenter(data.from.id, data.from.name);
+        setMobileSidebarOpen(true);
+      }
+    } catch (e: any) {
+      setTraceError(e.message || 'Failed to trace path');
+    } finally {
+      setTracingPath(false);
+    }
+  }, [traceFromName, traceToName, traceNodeOptions, selectCenter]);
 
   // Find edges connected to inspected node
   const selectedNodeEdges = inspectedNode
@@ -272,25 +393,25 @@ export default function MapPage() {
     return { otherNode, label, significance: strongest.significance };
   }, [inspectedNode, nodes, selectedNodeEdges]);
 
-  const filteredPlaceholderOptions = useMemo(() => {
+  const filteredExistingNodeOptions = useMemo(() => {
     const q = placeholderQuery.trim().toLowerCase();
-    if (!q) return placeholderOptions;
-    return placeholderOptions.filter((p) => `${p.name} ${p.type}`.toLowerCase().includes(q));
-  }, [placeholderOptions, placeholderQuery]);
+    if (!q) return existingNodeOptions;
+    return existingNodeOptions.filter((p) => `${p.name} ${p.type}`.toLowerCase().includes(q));
+  }, [existingNodeOptions, placeholderQuery]);
 
   return (
     <div className="h-screen flex flex-col bg-white text-slate-900 overflow-hidden">
       {/* ── Top bar ── */}
       <div className="border-b border-slate-200 bg-white/80 backdrop-blur-sm shrink-0 z-40">
-        <div className="flex items-center gap-4 px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3 px-3 sm:px-4 py-2.5">
           <a href="/" className="text-lg font-semibold text-slate-900 tracking-tight shrink-0">
             WORLDVIEW
           </a>
-          <div className="h-5 w-px bg-slate-300" />
-          <h1 className="text-sm font-medium text-slate-500 shrink-0">Corruption Map</h1>
+          <div className="hidden sm:block h-5 w-px bg-slate-300" />
+          <h1 className="hidden sm:block text-sm font-medium text-slate-500 shrink-0">Corruption Map</h1>
 
           {/* Search */}
-          <div className="relative flex-1 max-w-md ml-4">
+          <div className="relative order-3 sm:order-none w-full sm:w-auto sm:flex-1 sm:max-w-md sm:ml-4">
             <input
               type="text"
               value={searchQuery}
@@ -324,7 +445,7 @@ export default function MapPage() {
           </div>
 
           {/* Filters */}
-          <div className="flex items-center gap-3 ml-auto shrink-0">
+          <div className="order-4 sm:order-none flex items-center gap-2 ml-0 sm:ml-auto shrink-0 overflow-x-auto max-w-full pb-1 sm:pb-0">
             <label className="text-xs text-slate-500">Tier:</label>
             <select
               value={tierFilter}
@@ -433,7 +554,7 @@ export default function MapPage() {
       </div>
 
       {/* ── Main content ── */}
-      <div className="flex flex-1 min-h-0">
+      <div className="flex flex-1 min-h-0 relative">
         {/* Graph canvas */}
         <div className="flex-1 relative">
           {loading ? (
@@ -456,20 +577,128 @@ export default function MapPage() {
               nodes={nodes}
               edges={edges}
               centerId={centerId}
+              viaNodeIds={viaNodeIds}
               onNodeSelect={handleNodeSelect}
               onNodeExpand={handleNodeExpand}
             />
           )}
+
+          <button
+            onClick={() => setMobileSidebarOpen((v) => !v)}
+            className="md:hidden absolute bottom-4 right-4 z-30 px-3 py-2 rounded-lg bg-slate-900 text-white text-xs shadow-lg"
+          >
+            {mobileSidebarOpen ? 'Hide Details' : 'Show Details'}
+          </button>
         </div>
 
+        {mobileSidebarOpen && (
+          <button
+            onClick={() => setMobileSidebarOpen(false)}
+            className="md:hidden absolute inset-0 bg-slate-900/25 z-40"
+            aria-label="Close details panel overlay"
+          />
+        )}
+
         {/* ── Sidebar: Node Detail ── */}
-        <div className="w-96 border-l border-slate-200 bg-slate-50 overflow-y-auto shrink-0">
+        <div
+          className={`fixed md:static top-0 right-0 h-full md:h-auto w-[92vw] max-w-[420px] md:w-96 border-l border-slate-200 bg-slate-50 overflow-y-auto shrink-0 z-50 md:z-auto transition-transform duration-200 ${
+            mobileSidebarOpen ? 'translate-x-0' : 'translate-x-full md:translate-x-0'
+          }`}
+        >
+          <div className="md:hidden sticky top-0 z-10 flex items-center justify-between px-3 py-2 border-b border-slate-200 bg-slate-50">
+            <div className="text-sm font-medium text-slate-700">Node Details</div>
+            <button
+              onClick={() => setMobileSidebarOpen(false)}
+              className="text-xs px-2 py-1 rounded border border-slate-300 text-slate-700"
+            >
+              Close
+            </button>
+          </div>
           {!inspectedNode ? (
             <div className="p-4">
               <h2 className="text-base font-semibold text-slate-900">Node Details</h2>
               <p className="text-sm text-slate-500 mt-2">
                 Click any node to inspect essential facts and evidence-backed connections.
               </p>
+              <div className="mt-4 bg-white border border-slate-200 rounded-lg p-3 space-y-2">
+                <h3 className="text-sm font-medium text-slate-700">Trace Connection Path</h3>
+                <p className="text-xs text-slate-500">
+                  Pick any two nodes by name and trace the shortest known relationship path between them.
+                </p>
+                <input
+                  list="trace-node-options"
+                  value={traceFromName}
+                  onChange={(e) => setTraceFromName(e.target.value)}
+                  placeholder="From node (e.g., Jeffrey Epstein)"
+                  className="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                />
+                <input
+                  list="trace-node-options"
+                  value={traceToName}
+                  onChange={(e) => setTraceToName(e.target.value)}
+                  placeholder="To node (e.g., Elon Musk)"
+                  className="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                />
+                <datalist id="trace-node-options">
+                  {traceNodeOptions.map((n) => (
+                    <option key={n.id} value={n.name} />
+                  ))}
+                </datalist>
+                <div className="flex gap-2">
+                  <button
+                    onClick={traceConnectionPath}
+                    disabled={tracingPath || !traceFromName.trim() || !traceToName.trim()}
+                    className="px-3 py-1.5 text-xs rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {tracingPath ? 'Tracing...' : 'Trace Path'}
+                  </button>
+                  <button
+                    onClick={loadTraceNodeOptions}
+                    disabled={loadingTraceNodes}
+                    className="px-3 py-1.5 text-xs rounded-md border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    {loadingTraceNodes ? 'Refreshing...' : 'Refresh Nodes'}
+                  </button>
+                </div>
+                {traceError && (
+                  <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5">
+                    {traceError}
+                  </div>
+                )}
+                {traceResult && !traceResult.found && (
+                  <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+                    {traceResult.message || 'No path found between these nodes yet.'}
+                  </div>
+                )}
+                {traceResult?.found && (traceResult.edges?.length || 0) > 0 && (
+                  <div className="space-y-1.5 pt-1">
+                    <div className="text-xs text-slate-600">
+                      Path found: <span className="font-medium text-slate-800">{traceResult.hops} hops</span>
+                    </div>
+                    {(traceResult.edges || []).map((edge, idx) => {
+                      const rel = REL_LABELS[edge.relationshipType] || edge.relationshipType.replace(/_/g, ' ');
+                      return (
+                        <div key={edge.id} className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded px-2 py-1.5">
+                          <button
+                            onClick={() => selectCenter(edge.sourceId, edge.sourceName)}
+                            className="font-medium text-blue-700 hover:text-blue-600"
+                          >
+                            {edge.sourceName}
+                          </button>{' '}
+                          <span className="text-slate-500">{rel}</span>{' '}
+                          <button
+                            onClick={() => selectCenter(edge.targetId, edge.targetName)}
+                            className="font-medium text-blue-700 hover:text-blue-600"
+                          >
+                            {edge.targetName}
+                          </button>{' '}
+                          <span className="text-slate-400">(step {idx + 1})</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
           ) : (
             <div className="p-4 space-y-4">
@@ -600,35 +829,35 @@ export default function MapPage() {
 
               {editorMode && (
                 <div className="bg-white border border-slate-200 rounded-lg p-3 space-y-2">
-                  <h3 className="text-sm font-medium text-slate-700">Connect Existing Placeholder</h3>
+                  <h3 className="text-sm font-medium text-slate-700">Connect Existing Node</h3>
                   <p className="text-xs text-slate-500">
-                    Link this node to an existing placeholder and queue research for how they are connected.
+                    Link this node to any existing node and queue research for evidence-backed connection details.
                   </p>
                   <div className="flex gap-2">
                     <input
                       value={placeholderQuery}
                       onChange={(e) => setPlaceholderQuery(e.target.value)}
-                      placeholder="Search placeholders..."
+                      placeholder="Search existing nodes..."
                       className="flex-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm"
                     />
                     <button
-                      onClick={loadPlaceholderOptions}
-                      disabled={loadingPlaceholders}
+                      onClick={() => loadExistingNodeOptions(placeholderQuery)}
+                      disabled={loadingExistingNodes}
                       className="px-2 py-1.5 text-xs rounded-md border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                     >
                       Refresh
                     </button>
                   </div>
                   <select
-                    value={selectedPlaceholderId}
-                    onChange={(e) => setSelectedPlaceholderId(e.target.value)}
+                    value={selectedExistingNodeId}
+                    onChange={(e) => setSelectedExistingNodeId(e.target.value)}
                     className="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm text-slate-700"
-                    disabled={loadingPlaceholders || filteredPlaceholderOptions.length === 0}
+                    disabled={loadingExistingNodes || filteredExistingNodeOptions.length === 0}
                   >
-                    {filteredPlaceholderOptions.length === 0 ? (
-                      <option value="">No placeholders found</option>
+                    {filteredExistingNodeOptions.length === 0 ? (
+                      <option value="">No nodes found</option>
                     ) : (
-                      filteredPlaceholderOptions.map((p) => (
+                      filteredExistingNodeOptions.map((p) => (
                         <option key={p.id} value={p.id}>
                           {p.name} ({p.type.replace('_', ' ')})
                         </option>
@@ -636,8 +865,8 @@ export default function MapPage() {
                     )}
                   </select>
                   <button
-                    onClick={connectExistingPlaceholder}
-                    disabled={linking || !selectedPlaceholderId}
+                    onClick={connectExistingNode}
+                    disabled={linking || !selectedExistingNodeId}
                     className="px-3 py-1.5 text-xs rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
                   >
                     {linking ? 'Connecting...' : 'Connect + Queue Research'}
@@ -646,6 +875,86 @@ export default function MapPage() {
               )}
 
               <div className="border-t border-slate-200" />
+
+              <div className="bg-white border border-slate-200 rounded-lg p-3 space-y-2">
+                <h3 className="text-sm font-medium text-slate-700">Trace Connection Path</h3>
+                <p className="text-xs text-slate-500">
+                  Pick any two nodes by name and trace the shortest known relationship path between them.
+                </p>
+                <input
+                  list="trace-node-options"
+                  value={traceFromName}
+                  onChange={(e) => setTraceFromName(e.target.value)}
+                  placeholder="From node (e.g., Jeffrey Epstein)"
+                  className="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                />
+                <input
+                  list="trace-node-options"
+                  value={traceToName}
+                  onChange={(e) => setTraceToName(e.target.value)}
+                  placeholder="To node (e.g., Elon Musk)"
+                  className="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                />
+                <datalist id="trace-node-options">
+                  {traceNodeOptions.map((n) => (
+                    <option key={n.id} value={n.name} />
+                  ))}
+                </datalist>
+                <div className="flex gap-2">
+                  <button
+                    onClick={traceConnectionPath}
+                    disabled={tracingPath || !traceFromName.trim() || !traceToName.trim()}
+                    className="px-3 py-1.5 text-xs rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {tracingPath ? 'Tracing...' : 'Trace Path'}
+                  </button>
+                  <button
+                    onClick={loadTraceNodeOptions}
+                    disabled={loadingTraceNodes}
+                    className="px-3 py-1.5 text-xs rounded-md border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    {loadingTraceNodes ? 'Refreshing...' : 'Refresh Nodes'}
+                  </button>
+                </div>
+                {traceError && (
+                  <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5">
+                    {traceError}
+                  </div>
+                )}
+                {traceResult && !traceResult.found && (
+                  <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+                    {traceResult.message || 'No path found between these nodes yet.'}
+                  </div>
+                )}
+                {traceResult?.found && (traceResult.edges?.length || 0) > 0 && (
+                  <div className="space-y-1.5 pt-1">
+                    <div className="text-xs text-slate-600">
+                      Path found: <span className="font-medium text-slate-800">{traceResult.hops} hops</span>
+                    </div>
+                    {(traceResult.edges || []).map((edge, idx) => {
+                      const rel = REL_LABELS[edge.relationshipType] || edge.relationshipType.replace(/_/g, ' ');
+                      return (
+                        <div key={edge.id} className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded px-2 py-1.5">
+                          <button
+                            onClick={() => selectCenter(edge.sourceId, edge.sourceName)}
+                            className="font-medium text-blue-700 hover:text-blue-600"
+                          >
+                            {edge.sourceName}
+                          </button>{' '}
+                          <span className="text-slate-500">{rel}</span>{' '}
+                          <button
+                            onClick={() => selectCenter(edge.targetId, edge.targetName)}
+                            className="font-medium text-blue-700 hover:text-blue-600"
+                          >
+                            {edge.targetName}
+                          </button>{' '}
+                          <span className="text-slate-400">(step {idx + 1})</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
 
               {/* Connections */}
               <div>

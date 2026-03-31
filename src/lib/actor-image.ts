@@ -35,7 +35,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 }
 
 function isPersonType(type: ActorType): boolean {
-  return ['politician', 'lobbyist', 'media_figure'].includes(type);
+  return ['politician', 'lobbyist', 'media_figure', 'donor', 'operative'].includes(type);
 }
 
 function filePathFromCommons(fileName: string): string {

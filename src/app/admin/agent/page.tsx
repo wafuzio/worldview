@@ -60,20 +60,50 @@ type NewNodeSummary = {
   }[];
 };
 
+type MissingNodeSuggestion = {
+  name: string;
+  type: string;
+  rationale: string;
+  importance: number;
+  suggestedConnections: {
+    existingNodeName: string;
+    relationshipHypothesis: string;
+  }[];
+};
+
 export default function AgentDashboard() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [queueFilter, setQueueFilter] = useState('pending');
   const [isRunning, setIsRunning] = useState(false);
   const [isDiscovering, setIsDiscovering] = useState(false);
+  const [isDiscoveringNodes, setIsDiscoveringNodes] = useState(false);
+  const [isAddingDiscoveredNodes, setIsAddingDiscoveredNodes] = useState(false);
   const [runResult, setRunResult] = useState<any>(null);
+  const [isDedupScanning, setIsDedupScanning] = useState(false);
+  const [isDedupMerging, setIsDedupMerging] = useState(false);
+  const [dedupResult, setDedupResult] = useState<any>(null);
+  const [selectedDedupPairs, setSelectedDedupPairs] = useState<Set<string>>(new Set());
   const [liveEvents, setLiveEvents] = useState<any[]>([]);
   const [newTopic, setNewTopic] = useState('');
   const [newPriority, setNewPriority] = useState('medium');
   const [newDepth, setNewDepth] = useState('standard');
   const [runConfig, setRunConfig] = useState({ maxTopics: 5, depth: 'standard', autoQueue: true });
+  const [connectionConfig, setConnectionConfig] = useState({
+    maxNewLinks: 25,
+    queueVerificationTopics: true,
+    dryRun: false,
+  });
+  const [isConnecting, setIsConnecting] = useState(false);
   const [discoveryMode, setDiscoveryMode] = useState<string>('all');
-  const [activeTab, setActiveTab] = useState<'overview' | 'queue' | 'runs'>('overview');
+  const [nodeDiscoveryMax, setNodeDiscoveryMax] = useState(10);
+  const [nodeSuggestions, setNodeSuggestions] = useState<MissingNodeSuggestion[]>([]);
+  const [selectedNodeSuggestionNames, setSelectedNodeSuggestionNames] = useState<string[]>([]);
+  const [recentActivity, setRecentActivity] = useState<{ nodes: any[]; connections: any[] } | null>(null);
+  const [activeTab, setActiveTab] = useState<'overview' | 'queue' | 'runs' | 'activity' | 'quality'>('overview');
+  const [cycleStatus, setCycleStatus] = useState<any>(null);
+  const [isCycleRunning, setIsCycleRunning] = useState(false);
+  const [cycleResult, setCycleResult] = useState<any>(null);
   const [nowTick, setNowTick] = useState(Date.now());
   const feedRef = useRef<HTMLDivElement>(null);
 
@@ -97,8 +127,30 @@ export default function AgentDashboard() {
     }
   }, [queueFilter]);
 
+  const fetchActivity = useCallback(async () => {
+    try {
+      const res = await fetch('/api/agent/activity?limit=25');
+      const data = await res.json();
+      setRecentActivity(data);
+    } catch (e) {
+      console.error('Failed to fetch activity:', e);
+    }
+  }, []);
+
+  const fetchCycleStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/agent/cycle');
+      const data = await res.json();
+      setCycleStatus(data);
+    } catch (e) {
+      console.error('Failed to fetch cycle status:', e);
+    }
+  }, []);
+
   useEffect(() => { fetchStatus(); }, [fetchStatus]);
   useEffect(() => { fetchQueue(); }, [fetchQueue]);
+  useEffect(() => { if (activeTab === 'activity') fetchActivity(); }, [activeTab, fetchActivity]);
+  useEffect(() => { if (activeTab === 'quality') fetchCycleStatus(); }, [activeTab, fetchCycleStatus]);
 
   // Auto-refresh while running
   useEffect(() => {
@@ -231,6 +283,144 @@ export default function AgentDashboard() {
     }
   };
 
+  const handleDiscoverNodes = async () => {
+    setIsDiscoveringNodes(true);
+    setRunResult(null);
+    try {
+      const res = await fetch('/api/agent/discover-nodes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'suggest', maxNodes: nodeDiscoveryMax }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to discover nodes');
+      const suggestions: MissingNodeSuggestion[] = Array.isArray(data.suggestions) ? data.suggestions : [];
+      setNodeSuggestions(suggestions);
+      setSelectedNodeSuggestionNames(suggestions.map((s) => s.name));
+    } catch (e: any) {
+      setRunResult({ error: e.message });
+    } finally {
+      setIsDiscoveringNodes(false);
+      fetchStatus();
+    }
+  };
+
+  const toggleNodeSuggestion = (name: string) => {
+    setSelectedNodeSuggestionNames((prev) =>
+      prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]
+    );
+  };
+
+  const handleAddSelectedDiscoveredNodes = async () => {
+    const selected = nodeSuggestions.filter((s) => selectedNodeSuggestionNames.includes(s.name));
+    if (selected.length === 0) return;
+    setIsAddingDiscoveredNodes(true);
+    setRunResult(null);
+    try {
+      const res = await fetch('/api/agent/discover-nodes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'add', selected }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to add selected nodes');
+      setRunResult({ discoveredNodesAdd: data });
+      setNodeSuggestions([]);
+      setSelectedNodeSuggestionNames([]);
+      fetchQueue();
+      fetchStatus();
+    } catch (e: any) {
+      setRunResult({ error: e.message });
+    } finally {
+      setIsAddingDiscoveredNodes(false);
+    }
+  };
+
+  const handleRunConnectionAgent = async () => {
+    setIsConnecting(true);
+    setRunResult(null);
+    try {
+      const res = await fetch('/api/agent/connections', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(connectionConfig),
+      });
+      const data = await res.json();
+      setRunResult(data);
+      fetchStatus();
+      fetchQueue();
+    } catch (e: any) {
+      setRunResult({ error: e.message });
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  const handleDedupScan = async () => {
+    setIsDedupScanning(true);
+    setDedupResult(null);
+    setSelectedDedupPairs(new Set());
+    try {
+      const res = await fetch('/api/agent/dedup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'scan' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Scan failed');
+      setDedupResult(data);
+      // Pre-select high-confidence duplicates
+      const autoSelect = new Set<string>(
+        (data.duplicates || [])
+          .filter((d: any) => d.confidence === 'high')
+          .map((d: any) => `${d.nodeA.id}__${d.nodeB.id}`)
+      );
+      setSelectedDedupPairs(autoSelect);
+    } catch (e: any) {
+      setDedupResult({ error: e.message });
+    } finally {
+      setIsDedupScanning(false);
+    }
+  };
+
+  const handleDedupMerge = async () => {
+    if (selectedDedupPairs.size === 0) return;
+    setIsDedupMerging(true);
+    try {
+      const pairs = Array.from(selectedDedupPairs).map((key) => {
+        const [idA, idB] = key.split('__');
+        const match = dedupResult?.duplicates?.find(
+          (d: any) => d.nodeA.id === idA && d.nodeB.id === idB
+        );
+        // Keep whichever name the LLM chose
+        const keepIsA = match ? match.keepName === match.nodeA.name : true;
+        return { keepId: keepIsA ? idA : idB, dropId: keepIsA ? idB : idA };
+      });
+      const res = await fetch('/api/agent/dedup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'merge', pairs }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Merge failed');
+      // Remove merged pairs from the candidate list and clear selection
+      setSelectedDedupPairs(new Set());
+      const mergedKeys = new Set(pairs.map((p) => `${p.keepId}__${p.dropId}`).concat(pairs.map((p) => `${p.dropId}__${p.keepId}`)));
+      setDedupResult((prev: any) => ({
+        ...prev,
+        mergeResult: data,
+        duplicates: (prev?.duplicates ?? []).filter(
+          (d: any) => !mergedKeys.has(`${d.nodeA.id}__${d.nodeB.id}`) && !mergedKeys.has(`${d.nodeB.id}__${d.nodeA.id}`)
+        ),
+      }));
+      fetchStatus();
+    } catch (e: any) {
+      setDedupResult((prev: any) => ({ ...prev, mergeError: (e as any).message }));
+    } finally {
+      setIsDedupMerging(false);
+    }
+  };
+
   const handleQueueAction = async (id: string, action: string, extra?: any) => {
     try {
       await fetch('/api/agent/queue', {
@@ -288,12 +478,12 @@ export default function AgentDashboard() {
     <main className="min-h-screen bg-slate-100">
       <div className="max-w-6xl mx-auto px-4 py-8">
         {/* Header */}
-        <div className="flex justify-between items-center mb-8">
+        <div className="flex flex-wrap justify-between items-start gap-3 mb-8">
           <div>
             <h1 className="text-2xl font-bold text-slate-900">Research Agent</h1>
-            <p className="text-slate-500 mt-1">Automated topic discovery, research, and ingestion</p>
+            <p className="text-slate-500 mt-1 text-sm">Automated topic discovery, research, and ingestion</p>
           </div>
-          <div className="flex gap-3 items-center">
+          <div className="flex gap-3 items-center flex-shrink-0">
             <Link href="/admin/ingest" className="text-blue-600 hover:underline text-sm">Ingest</Link>
             <Link href="/admin" className="text-blue-600 hover:underline text-sm">Admin</Link>
             <Link href="/" className="text-blue-600 hover:underline text-sm">Quiz</Link>
@@ -313,18 +503,21 @@ export default function AgentDashboard() {
         {/* Tabs */}
         <div className="flex gap-1 mb-6 bg-white rounded-lg p-1 shadow-sm">
           {([
-            { key: 'overview' as const, label: 'Overview & Controls' },
-            { key: 'queue' as const, label: `Queue${status ? ` (${status.queue.pending})` : ''}` },
-            { key: 'runs' as const, label: 'Run History' },
+            { key: 'overview' as const, label: 'Overview', labelFull: 'Overview & Controls' },
+            { key: 'activity' as const, label: 'Activity', labelFull: 'Recent Activity' },
+            { key: 'queue' as const, label: `Queue${status ? ` (${status.queue.pending})` : ''}`, labelFull: `Queue${status ? ` (${status.queue.pending})` : ''}` },
+            { key: 'runs' as const, label: 'Runs', labelFull: 'Run History' },
+            { key: 'quality' as const, label: 'Quality', labelFull: 'Quality Cycle' },
           ]).map(tab => (
             <button
               key={tab.key}
               onClick={() => setActiveTab(tab.key)}
-              className={`flex-1 px-4 py-2.5 rounded-md text-sm font-medium transition-colors ${
+              className={`flex-1 px-2 sm:px-4 py-2.5 rounded-md text-xs sm:text-sm font-medium transition-colors ${
                 activeTab === tab.key ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-50'
               }`}
             >
-              {tab.label}
+              <span className="sm:hidden">{tab.label}</span>
+              <span className="hidden sm:inline">{tab.labelFull}</span>
             </button>
           ))}
         </div>
@@ -335,42 +528,44 @@ export default function AgentDashboard() {
             {/* Add Topic */}
             <div className="bg-white rounded-lg shadow-sm p-6">
               <h2 className="text-lg font-semibold text-slate-800 mb-4">Add Topic to Queue</h2>
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2">
                 <input
                   type="text"
                   value={newTopic}
                   onChange={e => setNewTopic(e.target.value)}
                   onKeyDown={e => { if (e.key === 'Enter') handleAddTopic(); }}
-                  className="flex-1 p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  className="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                   placeholder="e.g., The revolving door between Goldman Sachs and the Treasury Department"
                 />
-                <select value={newPriority} onChange={e => setNewPriority(e.target.value)} className="p-3 border border-slate-300 rounded-lg">
-                  <option value="urgent">Do Next</option>
-                  <option value="high">High</option>
-                  <option value="medium">Medium</option>
-                  <option value="low">Low</option>
-                </select>
-                <select value={newDepth} onChange={e => setNewDepth(e.target.value)} className="p-3 border border-slate-300 rounded-lg">
-                  <option value="standard">Standard</option>
-                  <option value="deep">Deep</option>
-                </select>
-                <button
-                  onClick={handleAddTopic}
-                  disabled={!newTopic.trim()}
-                  className="px-5 py-3 bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 font-medium whitespace-nowrap"
-                >
-                  Add to Queue
-                </button>
+                <div className="flex gap-2">
+                  <select value={newPriority} onChange={e => setNewPriority(e.target.value)} className="flex-1 p-3 border border-slate-300 rounded-lg text-sm">
+                    <option value="urgent">Do Next</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                  <select value={newDepth} onChange={e => setNewDepth(e.target.value)} className="flex-1 p-3 border border-slate-300 rounded-lg text-sm">
+                    <option value="standard">Standard</option>
+                    <option value="deep">Deep</option>
+                  </select>
+                  <button
+                    onClick={handleAddTopic}
+                    disabled={!newTopic.trim()}
+                    className="px-5 py-3 bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 font-medium whitespace-nowrap"
+                  >
+                    Add to Queue
+                  </button>
+                </div>
               </div>
             </div>
 
             {/* Agent Controls */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
               {/* Run Agent */}
               <div className="bg-white rounded-lg shadow-sm p-6">
                 <h2 className="text-lg font-semibold text-slate-800 mb-3">Run Research Agent</h2>
                 <p className="text-sm text-slate-500 mb-4">Processes pending topics from the queue. Researches via LLM, ingests into DB, and queues suggested follow-ups.</p>
-                <div className="flex gap-3 mb-4">
+                <div className="flex flex-wrap gap-3 mb-4">
                   <div>
                     <label className="text-xs text-slate-500 block mb-1">Max Topics</label>
                     <select
@@ -457,6 +652,276 @@ export default function AgentDashboard() {
                   {isDiscovering ? 'Discovering...' : 'Discover Topics'}
                 </button>
               </div>
+
+              {/* Tighten Connections */}
+              <div className="bg-white rounded-lg shadow-sm p-6">
+                <h2 className="text-lg font-semibold text-slate-800 mb-3">Tighten Connections Agent</h2>
+                <p className="text-sm text-slate-500 mb-4">
+                  Strengthens existing links, adds likely missing node connections, and optionally queues verification research.
+                </p>
+                <div className="flex flex-wrap gap-3 mb-4">
+                  <div>
+                    <label className="text-xs text-slate-500 block mb-1">Max New Links</label>
+                    <select
+                      value={connectionConfig.maxNewLinks}
+                      onChange={e => setConnectionConfig({ ...connectionConfig, maxNewLinks: parseInt(e.target.value) })}
+                      className="p-2 border border-slate-300 rounded text-sm"
+                    >
+                      {[5, 10, 15, 25, 50, 100].map(n => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-500 block mb-1">Queue Verify</label>
+                    <select
+                      value={connectionConfig.queueVerificationTopics ? 'yes' : 'no'}
+                      onChange={e => setConnectionConfig({ ...connectionConfig, queueVerificationTopics: e.target.value === 'yes' })}
+                      className="p-2 border border-slate-300 rounded text-sm"
+                    >
+                      <option value="yes">Yes</option>
+                      <option value="no">No</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-500 block mb-1">Mode</label>
+                    <select
+                      value={connectionConfig.dryRun ? 'dry' : 'write'}
+                      onChange={e => setConnectionConfig({ ...connectionConfig, dryRun: e.target.value === 'dry' })}
+                      className="p-2 border border-slate-300 rounded text-sm"
+                    >
+                      <option value="write">Apply</option>
+                      <option value="dry">Dry Run</option>
+                    </select>
+                  </div>
+                </div>
+                <button
+                  onClick={handleRunConnectionAgent}
+                  disabled={isConnecting}
+                  className={`w-full px-4 py-3 rounded-lg font-medium text-white transition-colors ${
+                    isConnecting ? 'bg-yellow-500 animate-pulse' : 'bg-cyan-600 hover:bg-cyan-700'
+                  }`}
+                >
+                  {isConnecting ? 'Running Connection Agent...' : (connectionConfig.dryRun ? 'Run Dry Connection Audit' : 'Run Tighten Connections')}
+                </button>
+              </div>
+            </div>
+
+            {/* Discover Missing Nodes */}
+            <div className="bg-white rounded-lg shadow-sm p-6">
+              <h2 className="text-lg font-semibold text-slate-800 mb-3">Discover Missing Nodes</h2>
+              <p className="text-sm text-slate-500 mb-4">
+                Suggests 5-10 likely missing high-value nodes from current graph coverage. Review and pick which ones to add.
+              </p>
+              <div className="flex flex-wrap items-end gap-3 mb-4">
+                <div>
+                  <label className="text-xs text-slate-500 block mb-1">Suggestion Count</label>
+                  <select
+                    value={nodeDiscoveryMax}
+                    onChange={(e) => setNodeDiscoveryMax(parseInt(e.target.value))}
+                    className="p-2 border border-slate-300 rounded text-sm"
+                  >
+                    {[5, 6, 7, 8, 9, 10].map((n) => (
+                      <option key={n} value={n}>{n}</option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  onClick={handleDiscoverNodes}
+                  disabled={isDiscoveringNodes}
+                  className={`px-4 py-2 rounded-lg font-medium text-white transition-colors ${
+                    isDiscoveringNodes ? 'bg-yellow-500 animate-pulse' : 'bg-violet-600 hover:bg-violet-700'
+                  }`}
+                >
+                  {isDiscoveringNodes ? 'Discovering Nodes...' : 'Discover Missing Nodes'}
+                </button>
+                {nodeSuggestions.length > 0 && (
+                  <>
+                    <button
+                      onClick={() => setSelectedNodeSuggestionNames(nodeSuggestions.map((s) => s.name))}
+                      className="px-3 py-2 rounded-lg border border-slate-300 text-sm text-slate-700 hover:bg-slate-50"
+                    >
+                      Select All
+                    </button>
+                    <button
+                      onClick={() => setSelectedNodeSuggestionNames([])}
+                      className="px-3 py-2 rounded-lg border border-slate-300 text-sm text-slate-700 hover:bg-slate-50"
+                    >
+                      Clear
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {nodeSuggestions.length > 0 && (
+                <div className="space-y-2 mb-4">
+                  {nodeSuggestions.map((s) => {
+                    const checked = selectedNodeSuggestionNames.includes(s.name);
+                    return (
+                      <label key={s.name} className="block border border-slate-200 rounded-lg p-3 bg-slate-50">
+                        <div className="flex items-start gap-2">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => toggleNodeSuggestion(s.name)}
+                            className="mt-1"
+                          />
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="font-medium text-slate-800">{s.name}</span>
+                              <span className="text-xs px-1.5 py-0.5 rounded bg-slate-200 text-slate-600 capitalize">
+                                {s.type.replace(/_/g, ' ')}
+                              </span>
+                              <span className="text-xs px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">
+                                importance {s.importance}/5
+                              </span>
+                            </div>
+                            <p className="text-xs text-slate-600 mt-1">{s.rationale}</p>
+                            {s.suggestedConnections?.length > 0 && (
+                              <div className="text-xs text-slate-500 mt-1">
+                                Suggested ties: {s.suggestedConnections.map((c) => c.existingNodeName).join(', ')}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+
+              <button
+                onClick={handleAddSelectedDiscoveredNodes}
+                disabled={isAddingDiscoveredNodes || selectedNodeSuggestionNames.length === 0}
+                className={`px-4 py-2 rounded-lg font-medium text-white transition-colors ${
+                  isAddingDiscoveredNodes ? 'bg-yellow-500 animate-pulse' : 'bg-emerald-600 hover:bg-emerald-700'
+                } disabled:bg-slate-300 disabled:cursor-not-allowed`}
+              >
+                {isAddingDiscoveredNodes
+                  ? 'Adding Selected Nodes...'
+                  : `Add Selected Nodes (${selectedNodeSuggestionNames.length})`}
+              </button>
+            </div>
+
+            {/* Deduplicate Nodes */}
+            <div className="bg-white rounded-lg shadow-sm p-6">
+              <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+                <div>
+                  <h2 className="text-lg font-semibold text-slate-800">Deduplicate Nodes</h2>
+                  <p className="text-sm text-slate-500 mt-0.5">
+                    Scans for nodes with similar names (e.g. "Richard Nixon" vs "Richard Nixon (politician)") and uses LLM to judge whether they're the same entity.
+                  </p>
+                </div>
+                <button
+                  onClick={handleDedupScan}
+                  disabled={isDedupScanning || isDedupMerging}
+                  className={`px-4 py-2 rounded-lg font-medium text-white transition-colors whitespace-nowrap ${
+                    isDedupScanning ? 'bg-yellow-500 animate-pulse' : 'bg-rose-600 hover:bg-rose-700'
+                  } disabled:opacity-50`}
+                >
+                  {isDedupScanning ? 'Scanning...' : 'Scan for Duplicates'}
+                </button>
+              </div>
+
+              {dedupResult?.error && (
+                <p className="text-sm text-red-600">{dedupResult.error}</p>
+              )}
+
+              {dedupResult && !dedupResult.error && (
+                <>
+                  <div className="flex flex-wrap gap-4 text-sm mb-4">
+                    <span className="text-slate-600">Candidates checked: <strong>{dedupResult.totalCandidates ?? 0}</strong></span>
+                    <span className="text-rose-600">Likely duplicates: <strong>{dedupResult.duplicates?.length ?? 0}</strong></span>
+                    {(dedupResult.uncertain?.length ?? 0) > 0 && (
+                      <span className="text-amber-600">Uncertain: <strong>{dedupResult.uncertain.length}</strong></span>
+                    )}
+                    <span className="text-slate-400">Not duplicates: <strong>{dedupResult.notDuplicatesCount ?? 0}</strong></span>
+                  </div>
+
+                  {dedupResult.mergeResult && (
+                    <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg text-sm text-green-800">
+                      Merged <strong>{dedupResult.mergeResult.merged}</strong> node pair{dedupResult.mergeResult.merged !== 1 ? 's' : ''}.
+                      {dedupResult.mergeResult.results?.some((r: any) => r.status === 'error') && (
+                        <span className="text-red-600 ml-2">Some merges failed — check console.</span>
+                      )}
+                    </div>
+                  )}
+                  {dedupResult.mergeError && (
+                    <p className="mb-4 text-sm text-red-600">{dedupResult.mergeError}</p>
+                  )}
+
+                  {(dedupResult.duplicates?.length ?? 0) > 0 && (
+                    <>
+                      <div className="space-y-2 mb-4">
+                        {dedupResult.duplicates.map((d: any) => {
+                          const key = `${d.nodeA.id}__${d.nodeB.id}`;
+                          const checked = selectedDedupPairs.has(key);
+                          return (
+                            <label key={key} className="flex items-start gap-3 p-3 border border-slate-200 rounded-lg bg-slate-50 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => {
+                                  setSelectedDedupPairs(prev => {
+                                    const next = new Set(prev);
+                                    if (next.has(key)) next.delete(key); else next.add(key);
+                                    return next;
+                                  });
+                                }}
+                                className="mt-0.5"
+                              />
+                              <div className="flex-1 min-w-0">
+                                <div className="flex flex-wrap items-center gap-2 text-sm">
+                                  <span className="font-medium text-slate-800">{d.nodeA.name}</span>
+                                  <span className="text-slate-400 text-xs">({d.nodeA.type})</span>
+                                  <span className="text-slate-400">→</span>
+                                  <span className="font-medium text-rose-700 line-through decoration-slate-400">{d.nodeB.name}</span>
+                                  <span className="text-slate-400 text-xs">({d.nodeB.type})</span>
+                                  <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                                    d.confidence === 'high' ? 'bg-green-100 text-green-700' :
+                                    d.confidence === 'medium' ? 'bg-amber-100 text-amber-700' :
+                                    'bg-slate-100 text-slate-600'
+                                  }`}>{d.confidence}</span>
+                                </div>
+                                <p className="text-xs text-slate-500 mt-0.5">
+                                  Keep: <strong>{d.keepName}</strong> — {d.reason}
+                                </p>
+                              </div>
+                            </label>
+                          );
+                        })}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <button
+                          onClick={handleDedupMerge}
+                          disabled={selectedDedupPairs.size === 0 || isDedupMerging}
+                          className={`px-4 py-2 rounded-lg font-medium text-white transition-colors ${
+                            isDedupMerging ? 'bg-yellow-500 animate-pulse' : 'bg-rose-600 hover:bg-rose-700'
+                          } disabled:bg-slate-300 disabled:cursor-not-allowed`}
+                        >
+                          {isDedupMerging ? 'Merging...' : `Merge Selected (${selectedDedupPairs.size})`}
+                        </button>
+                        <button
+                          onClick={() => setSelectedDedupPairs(new Set(dedupResult.duplicates.map((d: any) => `${d.nodeA.id}__${d.nodeB.id}`)))}
+                          className="px-3 py-2 rounded-lg border border-slate-300 text-sm text-slate-700 hover:bg-slate-50"
+                        >
+                          Select All
+                        </button>
+                        <button
+                          onClick={() => setSelectedDedupPairs(new Set())}
+                          className="px-3 py-2 rounded-lg border border-slate-300 text-sm text-slate-700 hover:bg-slate-50"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </>
+                  )}
+
+                  {dedupResult.duplicates?.length === 0 && (
+                    <p className="text-sm text-green-700">No duplicates found — graph looks clean.</p>
+                  )}
+                </>
+              )}
             </div>
 
             {/* Live Feed — visible when running or has events */}
@@ -518,6 +983,30 @@ export default function AgentDashboard() {
               </div>
             )}
 
+            {runResult && !isRunning && typeof runResult.relationshipsScanned === 'number' && (
+              <div className="bg-cyan-50 border border-cyan-200 rounded-lg shadow-sm p-6">
+                <h3 className="font-semibold text-slate-800 mb-2">Connection Agent Result</h3>
+                <div className="flex flex-wrap gap-4 text-sm">
+                  <span className="text-slate-700">Scanned: <strong>{runResult.relationshipsScanned}</strong></span>
+                  <span className="text-green-700">Tightened: <strong>{runResult.relationshipsTightened}</strong></span>
+                  <span className="text-blue-700">Created: <strong>{runResult.missingLinksCreated}</strong></span>
+                  <span className="text-indigo-700">Queued Verify: <strong>{runResult.verificationTopicsQueued}</strong></span>
+                  <span className="text-slate-500">Status: <strong>{runResult.status}</strong></span>
+                </div>
+              </div>
+            )}
+
+            {runResult?.discoveredNodesAdd && !isRunning && (
+              <div className="bg-emerald-50 border border-emerald-200 rounded-lg shadow-sm p-6">
+                <h3 className="font-semibold text-slate-800 mb-2">Discovered Nodes Added</h3>
+                <div className="flex flex-wrap gap-4 text-sm">
+                  <span className="text-emerald-700">Added: <strong>{runResult.discoveredNodesAdd.added ?? 0}</strong></span>
+                  <span className="text-blue-700">Queued: <strong>{runResult.discoveredNodesAdd.queued ?? 0}</strong></span>
+                  <span className="text-slate-600">Already existed: <strong>{runResult.discoveredNodesAdd.skippedExisting ?? 0}</strong></span>
+                </div>
+              </div>
+            )}
+
             {/* New Nodes Summary (from completed research-agent run) */}
             {runResult?.type === 'complete' && !isRunning && (
               <div className="bg-white rounded-lg shadow-sm p-6 border border-slate-200">
@@ -575,11 +1064,112 @@ export default function AgentDashboard() {
           </div>
         )}
 
+        {/* ── Activity Tab ── */}
+        {activeTab === 'activity' && (
+          <div className="space-y-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-slate-800">Recent Activity</h2>
+              <button
+                onClick={fetchActivity}
+                className="px-3 py-1.5 text-sm text-slate-500 hover:text-slate-700"
+              >
+                Refresh
+              </button>
+            </div>
+
+            {!recentActivity ? (
+              <div className="bg-white rounded-lg shadow-sm p-8 text-center text-slate-400">Loading...</div>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Recent Nodes */}
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-700 mb-3 uppercase tracking-wide">
+                    Nodes ({recentActivity.nodes.length})
+                  </h3>
+                  {recentActivity.nodes.length === 0 ? (
+                    <div className="bg-white rounded-lg shadow-sm p-6 text-center text-slate-400 text-sm">No nodes yet.</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {recentActivity.nodes.map((node: any) => (
+                        <div key={node.id} className="bg-white rounded-lg shadow-sm p-3">
+                          <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                              node.isNew ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
+                            }`}>
+                              {node.isNew ? 'new' : 'updated'}
+                            </span>
+                            <span className="text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 capitalize">
+                              {node.type.replace(/_/g, ' ')}
+                            </span>
+                            <span className="text-xs text-slate-400 ml-auto">
+                              {new Date(node.updatedAt).toLocaleString()}
+                            </span>
+                          </div>
+                          <p className="font-medium text-slate-800 text-sm">{node.name}</p>
+                          {node.title && (
+                            <p className="text-xs text-slate-500 mt-0.5 line-clamp-1">{node.title}</p>
+                          )}
+                          {node.affiliation && (
+                            <span className="text-xs text-slate-400">{node.affiliation}</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Recent Connections */}
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-700 mb-3 uppercase tracking-wide">
+                    Connections ({recentActivity.connections.length})
+                  </h3>
+                  {recentActivity.connections.length === 0 ? (
+                    <div className="bg-white rounded-lg shadow-sm p-6 text-center text-slate-400 text-sm">No connections yet.</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {recentActivity.connections.map((conn: any) => (
+                        <div key={conn.id} className="bg-white rounded-lg shadow-sm p-3">
+                          <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                              conn.isNew ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
+                            }`}>
+                              {conn.isNew ? 'new' : 'updated'}
+                            </span>
+                            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                              conn.tier === 'documented' ? 'bg-blue-100 text-blue-700' :
+                              conn.tier === 'interactional' ? 'bg-purple-100 text-purple-700' :
+                              'bg-orange-100 text-orange-700'
+                            }`}>
+                              {conn.tier}
+                            </span>
+                            <span className="text-xs text-slate-400">sig {conn.significance}/5</span>
+                            <span className="text-xs text-slate-400 ml-auto">
+                              {new Date(conn.updatedAt).toLocaleString()}
+                            </span>
+                          </div>
+                          <p className="text-sm text-slate-800">
+                            <span className="font-medium">{conn.source.name}</span>
+                            <span className="text-slate-400 mx-1.5">{conn.relationshipType.replace(/_/g, ' ')}</span>
+                            <span className="font-medium">{conn.target.name}</span>
+                          </p>
+                          {conn.description && (
+                            <p className="text-xs text-slate-500 mt-0.5 line-clamp-2">{conn.description}</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* ── Queue Tab ── */}
         {activeTab === 'queue' && (
           <div className="space-y-4">
             {/* Filter */}
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {['pending', 'completed', 'failed', 'skipped', 'all'].map(f => (
                 <button
                   key={f}
@@ -613,45 +1203,48 @@ export default function AgentDashboard() {
                   </div>
                 )}
                 {queueItems.map(item => (
-                  <div key={item.id} className="bg-white rounded-lg shadow-sm p-4 group">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${priorityColor(item.priority)}`}>{item.priority}</span>
-                          <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${statusColor(item.status)}`}>{item.status}</span>
-                          <span className="text-xs text-slate-400">{sourceLabel(item.source)}</span>
-                        </div>
-                        <p className="font-medium text-slate-800 text-sm">{item.topic}</p>
-                        {item.rationale && (
-                          <p className="text-xs text-slate-500 mt-0.5">{item.rationale}</p>
-                        )}
-                        {item.error && (
-                          <p className="text-xs text-red-600 mt-0.5">Error: {item.error}</p>
-                        )}
-                        {item.status === 'completed' && (
-                          <p className="text-xs text-green-600 mt-0.5">
-                            Created: {item.evidenceCreated ?? 0} evidence, {item.entitiesCreated ?? 0} entities, {item.relationshipsCreated ?? 0} relationships
-                          </p>
-                        )}
-                      </div>
-                      <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div key={item.id} className="bg-white rounded-lg shadow-sm p-3 group">
+                    {/* Badges + actions in one row */}
+                    <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                      {item.status === 'pending' ? (
+                        <select
+                          value={item.priority}
+                          onChange={e => handleQueueAction(item.id, 'prioritize', { priority: e.target.value })}
+                          className={`px-1.5 py-0.5 rounded text-xs font-medium border-0 cursor-pointer appearance-none ${priorityColor(item.priority)}`}
+                        >
+                          <option value="urgent">do next</option>
+                          <option value="high">high</option>
+                          <option value="medium">medium</option>
+                          <option value="low">low</option>
+                        </select>
+                      ) : (
+                        <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${priorityColor(item.priority)}`}>{item.priority}</span>
+                      )}
+                      <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${statusColor(item.status)}`}>{item.status}</span>
+                      <span className="text-xs text-slate-400">{sourceLabel(item.source)}</span>
+                      <div className="flex gap-1 ml-auto sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                         {item.status === 'pending' && (
-                          <>
-                            {item.priority !== 'urgent' ? (
-                              <button onClick={() => handleQueueAction(item.id, 'pin_next')} className="px-2 py-1 text-xs text-fuchsia-700 hover:bg-fuchsia-50 rounded">Do Next</button>
-                            ) : (
-                              <button onClick={() => handleQueueAction(item.id, 'unpin_next', { priority: 'high' })} className="px-2 py-1 text-xs text-fuchsia-700 hover:bg-fuchsia-50 rounded">Clear Next</button>
-                            )}
-                            <button onClick={() => handleQueueAction(item.id, 'prioritize', { priority: 'high' })} className="px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 rounded">Boost</button>
-                            <button onClick={() => handleQueueAction(item.id, 'skip')} className="px-2 py-1 text-xs text-slate-500 hover:bg-slate-50 rounded">Skip</button>
-                          </>
+                          <button onClick={() => handleQueueAction(item.id, 'skip')} className="px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-50 rounded">Skip</button>
                         )}
                         {(item.status === 'failed' || item.status === 'skipped') && (
-                          <button onClick={() => handleQueueAction(item.id, 'requeue')} className="px-2 py-1 text-xs text-blue-600 hover:bg-blue-50 rounded">Re-queue</button>
+                          <button onClick={() => handleQueueAction(item.id, 'requeue')} className="px-2 py-0.5 text-xs text-blue-600 hover:bg-blue-50 rounded">Re-queue</button>
                         )}
-                        <button onClick={() => handleQueueAction(item.id, 'delete')} className="px-2 py-1 text-xs text-red-500 hover:bg-red-50 rounded">Delete</button>
+                        <button onClick={() => handleQueueAction(item.id, 'delete')} className="px-2 py-0.5 text-xs text-red-500 hover:bg-red-50 rounded">Delete</button>
                       </div>
                     </div>
+                    {/* Topic — full width, no competing column */}
+                    <p className="font-medium text-slate-800 text-sm leading-snug">{item.topic}</p>
+                    {item.rationale && (
+                      <p className="text-xs text-slate-500 mt-0.5 line-clamp-1">{item.rationale}</p>
+                    )}
+                    {item.error && (
+                      <p className="text-xs text-red-600 mt-0.5 line-clamp-1">Error: {item.error}</p>
+                    )}
+                    {item.status === 'completed' && (
+                      <p className="text-xs text-green-600 mt-0.5">
+                        {item.evidenceCreated ?? 0} evidence · {item.entitiesCreated ?? 0} entities · {item.relationshipsCreated ?? 0} relationships
+                      </p>
+                    )}
                   </div>
                 ))}
               </div>
@@ -669,8 +1262,8 @@ export default function AgentDashboard() {
             ) : (
               status?.recentRuns.map(run => (
                 <div key={run.id} className="bg-white rounded-lg shadow-sm p-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-1 mb-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className={`px-2 py-0.5 rounded text-xs font-medium ${statusColor(run.status)}`}>{run.status}</span>
                       <span className="text-xs text-slate-400 capitalize">{run.runType}</span>
                       <span className="text-xs text-slate-400">{new Date(run.startedAt).toLocaleString()}</span>

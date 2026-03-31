@@ -23,6 +23,7 @@ export async function GET(request: NextRequest) {
   const tier = searchParams.get('tier') || 'all';
   const minSignificance = parseInt(searchParams.get('minSignificance') || '1');
   const includeInferred = searchParams.get('includeInferred') === 'true';
+  const includeIndirect = searchParams.get('includeIndirect') === 'true';
 
   const tierFilter = tier === 'all' ? {} : { tier };
 
@@ -61,25 +62,28 @@ export async function GET(request: NextRequest) {
       ? buildInferredSameEntityEdges(allActors, [...edges, ...inferredEdges], { maxEdges: 180 })
       : [];
     const actorById = new Map(allActors.map((a) => [a.id, a]));
-    const indirectEdges = buildIndirectEdges(actorById, edges, { maxEdges: 320 });
-    const combinedEdges = [...edges, ...indirectEdges, ...inferredEdges, ...inferredSameEntityEdges];
+    const viaNodeIds = includeIndirect ? collectViaNodeIds(actorById, edges, { maxViaNodes: 320 }) : new Set<string>();
+    const combinedEdges = [...edges, ...inferredEdges, ...inferredSameEntityEdges];
 
     const actorIds = new Set<string>();
     for (const e of combinedEdges) {
       actorIds.add(e.source);
       actorIds.add(e.target);
     }
+    // Via nodes are already in actorIds (they have direct edges), but ensure they're included.
+    for (const id of Array.from(viaNodeIds)) actorIds.add(id);
 
     const nodes = allActors.filter((a) => actorIds.has(a.id)).map(toNode);
     return NextResponse.json({
       nodes,
       edges: combinedEdges,
+      viaNodeIds: Array.from(viaNodeIds),
       mode: 'overview',
       inferred: {
         enabled: includeInferred,
         edges: inferredEdges.length,
         sameEntityEdges: inferredSameEntityEdges.length,
-        indirectEdges: indirectEdges.length,
+        viaNodes: viaNodeIds.size,
       },
     });
   }
@@ -137,15 +141,11 @@ export async function GET(request: NextRequest) {
   });
 
   const actorById = new Map(allActors.map((a) => [a.id, a]));
-  const indirectEdges = buildIndirectEdges(actorById, Array.from(edgeSet.values()), {
-    seedIds: visitedIds,
-    maxEdges: 140,
-  });
-  for (const edge of indirectEdges) {
-    edgeSet.set(edge.id, edge);
-    visitedIds.add(edge.source);
-    visitedIds.add(edge.target);
-  }
+  const viaNodeIds = includeIndirect
+    ? collectViaNodeIds(actorById, Array.from(edgeSet.values()), { seedIds: visitedIds, maxViaNodes: 140 })
+    : new Set<string>();
+  // Via nodes are already in visitedIds (seedIds check guarantees it), but ensure they stay included.
+  for (const id of Array.from(viaNodeIds)) visitedIds.add(id);
 
   const inferredEdges = includeInferred
     ? buildInferredAffiliationEdges(allActors, Array.from(edgeSet.values()), {
@@ -175,6 +175,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json({
     nodes: actors.map(toNode),
     edges: Array.from(edgeSet.values()),
+    viaNodeIds: Array.from(viaNodeIds),
     mode: 'subgraph',
     centerId,
     depth,
@@ -182,7 +183,7 @@ export async function GET(request: NextRequest) {
       enabled: includeInferred,
       edges: inferredEdges.length,
       sameEntityEdges: inferredSameEntityEdges.length,
-      indirectEdges: indirectEdges.length,
+      viaNodes: viaNodeIds.size,
     },
   });
 }
@@ -284,7 +285,7 @@ function toNode(actor: GraphActor) {
   };
 }
 
-const PERSON_TYPES = new Set(['politician', 'lobbyist', 'media_figure']);
+const PERSON_TYPES = new Set(['politician', 'donor', 'operative', 'lobbyist', 'media_figure']);
 const ORG_TYPES = new Set(['organization', 'corporation', 'party', 'pac']);
 
 function normalize(text: string | null | undefined): string {
@@ -479,7 +480,7 @@ function buildInferredSameEntityEdges(
   return inferred;
 }
 
-const POLITICAL_PERSONNEL_TYPES = new Set(['politician', 'lobbyist', 'media_figure', 'party']);
+const POLITICAL_PERSONNEL_TYPES = new Set(['politician', 'donor', 'operative', 'lobbyist', 'media_figure', 'party']);
 const WEAK_BRIDGE_TYPES = new Set([
   'employed_by',
   'appointed_by',
@@ -510,13 +511,16 @@ function humanRel(relationshipType: string): string {
   return relationshipType.replace(/_/g, ' ');
 }
 
-function buildIndirectEdges(
+// Identifies nodes that serve as bridges between other nodes which have no direct connection.
+// Returns the set of via-node IDs rather than generating synthetic edges — the via nodes and
+// their real constituent edges are already in the graph, so no extra lines are needed.
+function collectViaNodeIds(
   actorById: Map<string, GraphActor>,
   directEdges: ActorRelEdge[],
-  options: { seedIds?: Set<string>; maxEdges?: number } = {}
-): ActorRelEdge[] {
+  options: { seedIds?: Set<string>; maxViaNodes?: number } = {}
+): Set<string> {
   const seedIds = options.seedIds;
-  const maxEdges = options.maxEdges ?? 200;
+  const maxViaNodes = options.maxViaNodes ?? 200;
 
   const directPairSet = new Set<string>();
   const incident = new Map<string, ActorRelEdge[]>();
@@ -529,16 +533,15 @@ function buildIndirectEdges(
     incident.get(e.target)!.push(e);
   }
 
-  const generatedKeys = new Set<string>();
-  const indirect: ActorRelEdge[] = [];
+  const viaNodeIds = new Set<string>();
 
   for (const [viaId, viaEdges] of Array.from(incident.entries())) {
     if (viaEdges.length < 2) continue;
     if (seedIds && !seedIds.has(viaId)) continue;
-    const via = actorById.get(viaId);
-    if (!via) continue;
+    if (!actorById.get(viaId)) continue;
 
-    for (let i = 0; i < viaEdges.length; i++) {
+    let isVia = false;
+    outer: for (let i = 0; i < viaEdges.length; i++) {
       for (let j = i + 1; j < viaEdges.length; j++) {
         const aEdge = viaEdges[i];
         const bEdge = viaEdges[j];
@@ -546,70 +549,26 @@ function buildIndirectEdges(
         const bId = bEdge.source === viaId ? bEdge.target : bEdge.source;
         if (!aId || !bId || aId === bId) continue;
         if (directPairSet.has(`${aId}::${bId}`)) continue;
+        if (seedIds && !seedIds.has(aId) && !seedIds.has(bId)) continue;
 
-        const keySorted = [aId, bId].sort();
-        const key = `${keySorted[0]}::${keySorted[1]}::${viaId}`;
-        if (generatedKeys.has(key)) continue;
-        generatedKeys.add(key);
-
-        const a = actorById.get(aId);
-        const b = actorById.get(bId);
-        if (!a || !b) continue;
-        if (seedIds && !seedIds.has(aId) && !seedIds.has(bId) && !seedIds.has(viaId)) continue;
-
-        // Gate out weak "same-hub co-affiliation" paths.
         const aType = aEdge.relationshipType;
         const bType = bEdge.relationshipType;
         const bothWeak = WEAK_BRIDGE_TYPES.has(aType) && WEAK_BRIDGE_TYPES.has(bType);
-        const hasStrongBridge = STRONG_BRIDGE_TYPES.has(aType) || STRONG_BRIDGE_TYPES.has(bType);
-        const evidenceA = (aEdge.evidence || []).length;
-        const evidenceB = (bEdge.evidence || []).length;
-        const hasEvidenceOnBothSegments = evidenceA > 0 && evidenceB > 0;
-
-        // Weak+weak bridges are too generic for indirect inference.
-        // Examples: appointed_by + employed_by via same hub.
         if (bothWeak) continue;
-        // Require either a strong bridge type or evidence on both path segments.
+        const hasStrongBridge = STRONG_BRIDGE_TYPES.has(aType) || STRONG_BRIDGE_TYPES.has(bType);
+        const hasEvidenceOnBothSegments = (aEdge.evidence || []).length > 0 && (bEdge.evidence || []).length > 0;
         if (!hasStrongBridge && !hasEvidenceOnBothSegments) continue;
 
-        const involvesContract =
-          aEdge.relationshipType === 'contracted_with' || bEdge.relationshipType === 'contracted_with';
-        const hasPoliticalPersonnel =
-          POLITICAL_PERSONNEL_TYPES.has(a.type) || POLITICAL_PERSONNEL_TYPES.has(b.type);
-
-        const baseSig = Math.max(1, Math.min(5, Math.round((aEdge.significance + bEdge.significance) / 2) - 1));
-        const significance = involvesContract && hasPoliticalPersonnel ? Math.min(5, baseSig + 1) : baseSig;
-
-        const mergedEvidenceMap = new Map<string, { id: string; title: string; sourceUrl: string | null; excerpt: string | null }>();
-        for (const ev of aEdge.evidence || []) mergedEvidenceMap.set(ev.id, ev);
-        for (const ev of bEdge.evidence || []) mergedEvidenceMap.set(ev.id, ev);
-        const mergedEvidence = Array.from(mergedEvidenceMap.values()).slice(0, 8);
-
-        const detail = `Indirect path via ${via.name}: ${a.name} ${humanRel(aEdge.relationshipType)} ${via.name}; ${via.name} ${humanRel(bEdge.relationshipType)} ${b.name}.`;
-        const contractNote = involvesContract && hasPoliticalPersonnel
-          ? ' Potential personnel/beneficiary path around contract activity.'
-          : '';
-
-        indirect.push({
-          id: `indirect:${keySorted[0]}:${keySorted[1]}:via:${viaId}:a:${aEdge.id}:b:${bEdge.id}`,
-          source: keySorted[0],
-          target: keySorted[1],
-          tier: 'analytical',
-          relationshipType: 'indirect_connection',
-          significance,
-          description: `${detail}${contractNote}`,
-          amount: null,
-          startDate: null,
-          endDate: null,
-          evidence: mergedEvidence,
-        });
-
-        if (indirect.length >= maxEdges) {
-          return indirect;
-        }
+        isVia = true;
+        break outer;
       }
+    }
+
+    if (isVia) {
+      viaNodeIds.add(viaId);
+      if (viaNodeIds.size >= maxViaNodes) break;
     }
   }
 
-  return indirect;
+  return viaNodeIds;
 }

@@ -42,6 +42,7 @@ interface CytoscapeGraphProps {
   nodes: GraphNode[];
   edges: GraphEdge[];
   centerId?: string | null;
+  viaNodeIds?: Set<string>;
   onNodeSelect: (node: GraphNode | null) => void;
   onNodeExpand: (nodeId: string) => void;
 }
@@ -68,7 +69,7 @@ const TIER_EDGE_COLORS: Record<string, string> = {
 };
 
 export default function CytoscapeGraph({
-  nodes, edges, centerId, onNodeSelect, onNodeExpand,
+  nodes, edges, centerId, viaNodeIds, onNodeSelect, onNodeExpand,
 }: CytoscapeGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cyRef = useRef<Core | null>(null);
@@ -83,21 +84,25 @@ export default function CytoscapeGraph({
   const buildElements = useCallback(() => {
     const nodeIds = new Set(nodes.map((n) => n.id));
 
-    const cyNodes = nodes.map((n) => ({
-      data: {
-        id: n.id,
-        label: n.name,
-        type: n.type,
-        description: n.description,
-        title: n.title,
-        affiliation: n.affiliation,
-        tags: n.tags,
-        connectionCount: n.connectionCount,
-        image: getNodeImage(n.type, n.imageUrl),
-        borderColor: getNodeBorderColor(n.type),
-        nodeSize: Math.max(52, Math.min(88, 44 + n.connectionCount * 4)),
-      },
-    }));
+    const cyNodes = nodes.map((n) => {
+      const isVia = viaNodeIds?.has(n.id) ?? false;
+      return {
+        data: {
+          id: n.id,
+          label: n.name,
+          type: n.type,
+          description: n.description,
+          title: n.title,
+          affiliation: n.affiliation,
+          tags: n.tags,
+          connectionCount: n.connectionCount,
+          image: getNodeImage(n.type, n.imageUrl),
+          borderColor: isVia ? '#f59e0b' : getNodeBorderColor(n.type),
+          nodeSize: Math.max(52, Math.min(88, 44 + n.connectionCount * 4)),
+          isVia,
+        },
+      };
+    });
 
     let skippedEdgeCount = 0;
     const cyEdges = edges
@@ -131,7 +136,7 @@ export default function CytoscapeGraph({
     }
 
     return [...cyNodes, ...cyEdges];
-  }, [nodes, edges]);
+  }, [nodes, edges, viaNodeIds]);
 
   useEffect(() => {
     if (!containerRef.current || nodes.length === 0) return;
@@ -208,6 +213,16 @@ export default function CytoscapeGraph({
           style: {
             'opacity': 0.15,
           } as cytoscape.Css.Node,
+        },
+
+        // Via/bridge nodes — dashed amber border to show they're connecting two otherwise unlinked nodes
+        {
+          selector: 'node[?isVia]',
+          style: {
+            'border-style': 'dashed' as any,
+            'border-color': '#f59e0b',
+            'border-width': 3,
+          } as any,
         },
 
         // ── Edges — color by tier ──

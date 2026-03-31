@@ -69,6 +69,27 @@ const ORGANIZATION = svg('#06b6d4', `
   </g>
 `);
 
+// Donor: diamond/gem shape — money is the power source
+const DONOR = svg('#16a34a', `
+  <g transform="translate(50,48)" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linejoin="round">
+    <polygon points="0,-20 16,-4 0,18 -16,-4" fill="#e2e8f0"/>
+    <line x1="-16" y1="-4" x2="16" y2="-4"/>
+    <line x1="-10" y1="-4" x2="0" y2="18"/>
+    <line x1="10" y1="-4" x2="0" y2="18"/>
+    <line x1="0" y1="-20" x2="-6" y2="-4"/>
+    <line x1="0" y1="-20" x2="6" y2="-4"/>
+  </g>
+`);
+
+// Operative: chess knight — strategist/architect
+const OPERATIVE = svg('#7c3aed', `
+  <g transform="translate(50,48)" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-8,16 h16 v-4 h-16 z" fill="#e2e8f0"/>
+    <path d="M-6,12 Q-10,-2 -4,-10 Q-2,-14 4,-16 Q2,-10 6,-8 Q12,-4 10,4 Q8,10 6,12 z" fill="#e2e8f0"/>
+    <circle cx="-2" cy="-6" r="1.5" fill="#94a3b8"/>
+  </g>
+`);
+
 const COURT_CASE = svg('#64748b', `
   <g transform="translate(50,48)" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" fill="none">
     <rect x="-6" y="-18" width="12" height="16" rx="2" fill="#e2e8f0"/>
@@ -114,6 +135,8 @@ export function getNodeImage(type: string, imageUrl?: string | null): string {
     case 'corporation': return CORPORATION;
     case 'media_figure': return MEDIA_FIGURE;
     case 'organization': return ORGANIZATION;
+    case 'donor': return DONOR;
+    case 'operative': return OPERATIVE;
     case 'legislation': return LEGISLATION;
     case 'event': return EVENT;
     default: return COURT_CASE;
@@ -129,6 +152,8 @@ export const NODE_BORDER_COLORS: Record<string, string> = {
   corporation: '#ef4444',
   media_figure: '#ec4899',
   organization: '#06b6d4',
+  donor: '#16a34a',
+  operative: '#7c3aed',
   legislation: '#0f766e',
   event: '#ea580c',
 };

@@ -68,6 +68,15 @@ Tier 3 (analytical — MUST have matching analyses entry): influenced_by, aligne
 ACTION TYPES:
 voted_yes, voted_no, sponsored, blocked, procedural_block, symbolic_vote, signed, vetoed, executive_order, appointed, public_stance, reversed_position, abstained, attempted_failed
 
+ENTITY TYPE CLASSIFICATION — use the most specific type:
+- politician: elected officials, appointed government officials, judges — people who hold/held state power
+- donor: individuals whose primary relevance is funding political activity (Soros, Koch, Adelson, Mercer, Crow). NOT politicians who also donate — only people whose structural role in the network is as a money source
+- operative: political strategists, fixers, dark money architects who aren't elected, aren't lobbyists, aren't media — their power is institutional engineering (Leonard Leo, Karl Rove, Roger Stone, Steve Bannon, Grover Norquist)
+- lobbyist: registered or de facto lobbyists — influence-for-hire professionals
+- media_figure: people whose power is narrative control (Murdoch, Carlson, Maddow)
+- organization, corporation, pac, party: institutional entities
+- legislation, court_case, event: non-person nodes
+
 Return your findings as a JSON object with this exact structure:
 
 {
@@ -94,9 +103,9 @@ Return your findings as a JSON object with this exact structure:
   "entities": [
     {
       "name": "Full name",
-      "type": "person|organization|legislation|court_case",
+      "type": "politician|donor|operative|lobbyist|media_figure|organization|corporation|pac|party|legislation|court_case|event",
       "description": "Brief description",
-      "title": "Current or relevant title",
+      "title": "Current or relevant title — for donors include primary source of wealth, for operatives include primary institutional role",
       "affiliation": "Party or organizational affiliation",
       "aliases": ["Alternative names"],
       "tags": ["Freeform tags for character mapping"]
